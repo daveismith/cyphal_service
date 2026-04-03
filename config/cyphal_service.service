@@ -1,0 +1,44 @@
+[Unit]
+Description=Cyphal Linux Service
+Documentation=https://github.com/daveismith/cyphal_service
+After=network.target
+Wants=network.target
+
+[Service]
+Type=notify
+User=cyphal
+Group=cyphal
+
+# Path to the installed binary.
+ExecStart=/usr/local/bin/cyphal_service
+
+# Restart the service if it exits unexpectedly.
+Restart=on-failure
+RestartSec=5s
+
+# Give the service up to 30 seconds to start before systemd declares a timeout.
+TimeoutStartSec=30
+
+# Logging – captured automatically by journald.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cyphal_service
+
+# Harden the service environment.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+
+# CAN / SocketCAN access – uncomment and adjust if needed.
+# AmbientCapabilities=CAP_NET_RAW
+# CapabilityBoundingSet=CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

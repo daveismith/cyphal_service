@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: cyphal_service
+
+jobs:
+  build-ubuntu:
+    name: Build release artefacts (Ubuntu 24.04 x86_64)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry & build artefacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Stage release artefacts
+        run: |
+          STAGING_DIR="staging/${BINARY_NAME}"
+          mkdir -p "${STAGING_DIR}/usr/local/bin"
+          mkdir -p "${STAGING_DIR}/lib/systemd/system"
+          mkdir -p "${STAGING_DIR}/docs"
+
+          cp "target/release/${BINARY_NAME}" "${STAGING_DIR}/usr/local/bin/${BINARY_NAME}"
+          cp "config/${BINARY_NAME}.service"  "${STAGING_DIR}/lib/systemd/system/${BINARY_NAME}.service"
+          cp README.md                         "${STAGING_DIR}/docs/README.md"
+
+          # Install helper script
+          cat > "${STAGING_DIR}/install.sh" << 'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          BINARY="usr/local/bin/cyphal_service"
+          SERVICE="lib/systemd/system/cyphal_service.service"
+          SERVICE_USER="cyphal"
+
+          # Create service user if it does not exist.
+          if ! id "${SERVICE_USER}" &>/dev/null; then
+              echo "Creating system user '${SERVICE_USER}'..."
+              sudo useradd --system --no-create-home --shell /usr/sbin/nologin "${SERVICE_USER}"
+          fi
+
+          echo "Installing binary..."
+          sudo install -o root -g root -m 755 "${BINARY}" "/${BINARY}"
+
+          echo "Installing systemd unit..."
+          sudo install -o root -g root -m 644 "${SERVICE}" "/${SERVICE}"
+
+          echo "Reloading systemd..."
+          sudo systemctl daemon-reload
+          sudo systemctl enable cyphal_service.service
+
+          echo "Done.  Start the service with:  sudo systemctl start cyphal_service"
+          EOF
+          chmod +x "${STAGING_DIR}/install.sh"
+
+      - name: Create tarball
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          TARBALL="${BINARY_NAME}-${VERSION}-x86_64-linux.tar.gz"
+          tar -czf "${TARBALL}" -C staging "${BINARY_NAME}"
+          echo "TARBALL=${TARBALL}" >> "${GITHUB_ENV}"
+
+      - name: Upload release artefact
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.TARBALL }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
