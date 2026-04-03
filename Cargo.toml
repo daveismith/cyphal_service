@@ -1,0 +1,23 @@
+[package]
+name = "cyphal_service"
+version = "0.1.0"
+edition = "2024"
+description = "Cyphal Linux Service - systemd daemon with REPL CLI"
+license = "MIT"
+authors = ["Cyphal Service Contributors"]
+
+[[bin]]
+name = "cyphal_service"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.44", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+rustyline = "14.0"
+sd-notify = "0.4"
+
+[profile.release]
+strip = true
+opt-level = 3
