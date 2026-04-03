@@ -1,0 +1,68 @@
+# cyphal.toml – example Cyphal transport configuration for cyphal_service
+#
+# Pass this file to cyphal_service with --config <path>.
+# Example: cyphal_service --foreground --config ~/cyphal.toml
+#
+# You may define as many [[transport]] entries as needed.  Each entry
+# starts a dedicated background worker that sends heartbeats and responds
+# to GetInfo requests on behalf of this service.
+
+# ── CAN via Linux SocketCAN ────────────────────────────────────────────────────
+# Requires the gs_usb (or native CAN) kernel module and a configured interface.
+# Not supported on macOS; the transport is skipped with a log error on macOS.
+#
+# [[transport]]
+# type      = "can"
+# name      = "can-socketcan"
+# driver    = "socketcan"       # Linux only
+# node_id   = 42
+# interface = "can0"            # SocketCAN interface name
+# fd        = false
+
+# ── CAN via gs_usb / candleLight USB ──────────────────────────────────────────
+# Works on Linux and macOS without any kernel module.
+# On Linux, make sure the gs_usb kernel module is NOT loaded:
+#   sudo rmmod gs_usb
+# On macOS, install libusb first:
+#   brew install libusb
+#
+# [[transport]]
+# type      = "can"
+# name      = "can-usb"
+# driver    = "gsusb"           # all platforms
+# node_id   = 43
+# usb_index = 0                 # 0 = first matching device
+# bitrate   = 1000000           # bit/s (default: 1 000 000)
+# fd        = false
+#
+# Optional VID/PID override (default: candleLight 0x1d50/0x606f):
+# vid       = "0x1d50"
+# pid       = "0x606f"
+
+# ── Cyphal/UDP ─────────────────────────────────────────────────────────────────
+# Works on Linux and macOS.
+#
+# [[transport]]
+# type      = "udp"
+# name      = "udp-primary"
+# node_id   = 100
+# interface = "192.168.1.50"    # local interface IP address to bind to
+# port      = 9382              # optional (default: 9382)
+
+# ── Cyphal/Serial ─────────────────────────────────────────────────────────────
+# Works on Linux and macOS.
+#
+# [[transport]]
+# type      = "serial"
+# name      = "serial-primary"
+# node_id   = 200
+# port      = "/dev/ttyUSB0"    # "/dev/cu.usbmodem…" on macOS
+# baud_rate = 115200            # optional (default: 115200)
+
+# ── Minimal working example (uncomment to use) ────────────────────────────────
+
+[[transport]]
+type      = "udp"
+name      = "udp-loopback"
+node_id   = 127
+interface = "127.0.0.1"

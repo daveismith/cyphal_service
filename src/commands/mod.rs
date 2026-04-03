@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
+pub mod get_info;
 pub mod hello;
 pub mod help;
+pub mod nodes;
 
 /// A command that can be registered with and executed via the [`CommandRegistry`].
 pub trait Command: Send + Sync {

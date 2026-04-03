@@ -83,6 +83,10 @@ classDiagram
 - **Foreground REPL** – interactive readline prompt, command history.
 - **Pluggable command architecture** – register new commands without touching
   existing code.
+- **Cyphal/CAN** – SocketCAN (Linux) and gs_usb/candleLight USB (all platforms).
+- **Cyphal/UDP** – all platforms.
+- **Cyphal/Serial** – all platforms.
+- **macOS support** – foreground/REPL mode works on macOS; CAN via gs_usb.
 - **Graceful shutdown** – handles `SIGTERM` and `SIGINT`.
 - **Configurable log level** via `RUST_LOG` environment variable.
 
@@ -161,15 +165,18 @@ Cyphal Linux Service
 Usage: cyphal_service [OPTIONS]
 
 Options:
-  -f, --foreground  Run in foreground with an interactive REPL instead of daemonising
-  -h, --help        Print help
-  -V, --version     Print version
+  -f, --foreground       Run in foreground with an interactive REPL instead of daemonising
+  -c, --config <FILE>    Path to a TOML configuration file for Cyphal transports
+  -h, --help             Print help
+  -V, --version          Print version
 ```
 
 ### Daemon mode (default)
 
 ```bash
 ./cyphal_service
+# With transports:
+./cyphal_service --config /etc/cyphal/cyphal.toml
 ```
 
 Outputs `hello` to stdout (captured by journald when running as a service)
@@ -179,6 +186,8 @@ once per minute.  Exit with `SIGTERM` or `Ctrl-C`.
 
 ```bash
 ./cyphal_service --foreground
+# With transports:
+./cyphal_service --foreground --config ~/cyphal.toml
 ```
 
 ```
@@ -186,10 +195,19 @@ cyphal_service – foreground mode
 Type 'help' for available commands, 'quit' or 'exit' to stop.
 cyphal> help
 Available commands:
+  get-info         Query a node's GetInfo. Usage: get-info <transport> <node-id>
   hello            Print a greeting
   help             List available commands
-cyphal> hello
-hello
+  nodes            List Cyphal nodes observed on transports. Usage: nodes [<transport>]
+cyphal> nodes
+Transport: udp-primary
+  Node ID  Uptime(s)  Health     Mode
+  42       15         0          0
+cyphal> get-info udp-primary 42
+Node 42  (org.example.my_device)
+Hardware : 1.0
+Software : 2.3
+Unique ID: 01:02:03:04:05:06:07:08:09:0a:0b:0c:0d:0e:0f:10
 cyphal> quit
 Goodbye.
 ```
@@ -229,6 +247,80 @@ sequenceDiagram
     cyphal_service->>systemd: sd_notify(STOPPING=1)
     cyphal_service->>cyphal_service: clean shutdown
 ```
+
+---
+
+## Cyphal transport configuration
+
+Transports are configured via a TOML file passed with `--config`.  A commented
+example is at [`config/cyphal.toml.example`](config/cyphal.toml.example).
+
+```toml
+# CAN via gs_usb / candleLight USB (all platforms)
+[[transport]]
+type     = "can"
+name     = "can-usb"
+driver   = "gsusb"
+node_id  = 42
+bitrate  = 1000000
+
+# CAN via Linux SocketCAN (Linux only)
+[[transport]]
+type      = "can"
+name      = "can0"
+driver    = "socketcan"
+node_id   = 43
+interface = "can0"
+
+# Cyphal/UDP
+[[transport]]
+type      = "udp"
+name      = "udp-primary"
+node_id   = 100
+interface = "192.168.1.50"
+
+# Cyphal/Serial
+[[transport]]
+type      = "serial"
+name      = "serial-primary"
+node_id   = 200
+port      = "/dev/ttyUSB0"
+baud_rate = 115200
+```
+
+---
+
+## macOS quick-start
+
+CAN on macOS requires a candleLight-compatible USB adapter (CANable, Canable-M,
+etc.) and the `libusb` library:
+
+```bash
+# 1. Install libusb
+brew install libusb
+
+# 2. Create a config file
+cat > ~/cyphal.toml << 'EOF'
+[[transport]]
+type    = "can"
+name    = "can-usb"
+driver  = "gsusb"
+node_id = 42
+bitrate = 1000000
+EOF
+
+# 3. Start in foreground mode
+cargo run -- --foreground --config ~/cyphal.toml
+```
+
+> **Note (Linux):** The `gs_usb` kernel module and the `gsusb` driver
+> conflict.  Before using `driver = "gsusb"`, unload the module:
+> `sudo rmmod gs_usb`
+
+> **Note (macOS):** If a KEXT from another USB CAN tool is loaded, unload it
+> before running cyphal_service.
+
+---
 
 ---
 

@@ -1,10 +1,20 @@
+use std::sync::Arc;
+
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use tokio::sync::watch;
 use tracing::info;
 
-use crate::commands::{CommandRegistry, hello::HelloCommand, help::HelpCommand, help::format_help};
+use crate::commands::{
+    CommandRegistry,
+    get_info::GetInfoCommand,
+    hello::HelloCommand,
+    help::{HelpCommand, format_help},
+    nodes::NodesCommand,
+};
+use crate::config::AppConfig;
 use crate::daemon;
+use crate::transport::{self, TransportHandle};
 
 /// Run the service in foreground / REPL mode.
 ///
@@ -13,15 +23,18 @@ use crate::daemon;
 /// dedicated OS thread (via [`tokio::task::spawn_blocking`]) so that blocking
 /// readline calls do not stall the async runtime.  When the REPL exits the
 /// background tasks are signalled to stop through the shared shutdown channel.
-pub async fn run() {
+pub async fn run(config: AppConfig) {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // Start transport workers and collect handles before building the registry.
+    let handles = Arc::new(transport::start_all(&config, shutdown_rx.clone()).await);
 
     // Start background tasks – identical to daemon mode.
     let tasks = tokio::spawn(daemon::run_tasks(shutdown_rx));
 
     // Build the command registry with all built-in commands.
     let mut registry = CommandRegistry::new();
-    register_defaults(&mut registry);
+    register_defaults(&mut registry, handles);
 
     println!("cyphal_service – foreground mode");
     println!("Type 'help' for available commands, 'quit' or 'exit' to stop.");
@@ -36,9 +49,11 @@ pub async fn run() {
 }
 
 /// Register all built-in commands into the registry.
-pub fn register_defaults(registry: &mut CommandRegistry) {
+pub fn register_defaults(registry: &mut CommandRegistry, handles: Arc<Vec<TransportHandle>>) {
     registry.register(Box::new(HelloCommand));
     registry.register(Box::new(HelpCommand));
+    registry.register(Box::new(NodesCommand::new(handles.clone())));
+    registry.register(Box::new(GetInfoCommand::new(handles)));
 }
 
 fn repl_loop(registry: CommandRegistry, shutdown_tx: watch::Sender<bool>) {
