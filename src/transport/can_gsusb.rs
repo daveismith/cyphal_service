@@ -629,7 +629,8 @@ impl<'a> TransferHandler<CanTransport> for GsUsbHandler<'a> {
             return false;
         };
         let node_id: u16 = transfer.header.source.map(u16::from).unwrap_or(0xFFFF);
-        self.state.on_heartbeat(node_id, hb.uptime, 0, 0);
+        self.state
+            .on_heartbeat(node_id, hb.uptime, hb.health.value, hb.mode.value);
         true
     }
 
