@@ -27,8 +27,9 @@ async fn main() {
     fmt().with_env_filter(filter).init();
 
     if args.foreground {
-        // Foreground / REPL mode – blocking call.
-        cli::run();
+        // Foreground / REPL mode – background tasks run via the same code
+        // path as daemon mode; the REPL is layered on top.
+        cli::run().await;
     } else {
         // Daemon mode – driven by the tokio async runtime.
         daemon::run().await;

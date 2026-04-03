@@ -1,34 +1,23 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-use std::time::Duration;
-
+use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
-use rustyline::{DefaultEditor, Result as RlResult};
+use tokio::sync::watch;
 use tracing::info;
 
 use crate::commands::{CommandRegistry, hello::HelloCommand, help::HelpCommand, help::format_help};
+use crate::daemon;
 
 /// Run the service in foreground / REPL mode.
 ///
-/// A background thread ticks every 60 seconds printing "hello" to stdout.
-/// The foreground thread runs a readline REPL allowing the operator to
-/// interact with the service via the [`CommandRegistry`].
-pub fn run() {
-    let running = Arc::new(AtomicBool::new(true));
+/// The same background tasks that run in daemon mode (via [`daemon::run_tasks`])
+/// are started on the tokio runtime.  The REPL is then layered on top in a
+/// dedicated OS thread (via [`tokio::task::spawn_blocking`]) so that blocking
+/// readline calls do not stall the async runtime.  When the REPL exits the
+/// background tasks are signalled to stop through the shared shutdown channel.
+pub async fn run() {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // Background tick thread.
-    let running_bg = running.clone();
-    let tick_handle = std::thread::spawn(move || {
-        while running_bg.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_secs(60));
-            if running_bg.load(Ordering::Relaxed) {
-                info!("hello");
-                println!("[tick] hello");
-            }
-        }
-    });
+    // Start background tasks – identical to daemon mode.
+    let tasks = tokio::spawn(daemon::run_tasks(shutdown_rx));
 
     // Build the command registry with all built-in commands.
     let mut registry = CommandRegistry::new();
@@ -37,12 +26,13 @@ pub fn run() {
     println!("cyphal_service – foreground mode");
     println!("Type 'help' for available commands, 'quit' or 'exit' to stop.");
 
-    if let Err(e) = repl_loop(&registry, &running) {
-        eprintln!("REPL error: {e}");
-    }
+    // Run the blocking REPL in a dedicated OS thread so it doesn't stall the
+    // tokio runtime.  When the closure returns the shutdown signal is sent.
+    tokio::task::spawn_blocking(move || repl_loop(registry, shutdown_tx))
+        .await
+        .ok();
 
-    running.store(false, Ordering::Relaxed);
-    tick_handle.join().ok();
+    tasks.await.ok();
 }
 
 /// Register all built-in commands into the registry.
@@ -51,8 +41,14 @@ pub fn register_defaults(registry: &mut CommandRegistry) {
     registry.register(Box::new(HelpCommand));
 }
 
-fn repl_loop(registry: &CommandRegistry, running: &Arc<AtomicBool>) -> RlResult<()> {
-    let mut rl = DefaultEditor::new()?;
+fn repl_loop(registry: CommandRegistry, shutdown_tx: watch::Sender<bool>) {
+    let mut rl = match DefaultEditor::new() {
+        Ok(rl) => rl,
+        Err(e) => {
+            eprintln!("REPL initialisation error: {e}");
+            return;
+        }
+    };
 
     loop {
         match rl.readline("cyphal> ") {
@@ -67,7 +63,6 @@ fn repl_loop(registry: &CommandRegistry, running: &Arc<AtomicBool>) -> RlResult<
                 match trimmed.as_str() {
                     "quit" | "exit" => {
                         println!("Goodbye.");
-                        running.store(false, Ordering::Relaxed);
                         break;
                     }
                     "help" => {
@@ -82,12 +77,16 @@ fn repl_loop(registry: &CommandRegistry, running: &Arc<AtomicBool>) -> RlResult<
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
                 println!("Goodbye.");
-                running.store(false, Ordering::Relaxed);
                 break;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                eprintln!("REPL error: {e}");
+                break;
+            }
         }
     }
 
-    Ok(())
+    // Signal background tasks to stop regardless of how the REPL exited.
+    let _ = shutdown_tx.send(true);
+    info!("Foreground REPL exited – stopping background tasks");
 }
