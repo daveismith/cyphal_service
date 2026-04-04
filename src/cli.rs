@@ -12,6 +12,7 @@ use crate::commands::{
     hello::HelloCommand,
     help::{HelpCommand, format_help},
     nodes::NodesCommand,
+    pnp::PnpListCommand,
 };
 use crate::config::AppConfig;
 use crate::daemon;
@@ -55,7 +56,8 @@ pub fn register_defaults(registry: &mut CommandRegistry, handles: Arc<Vec<Transp
     registry.register(Box::new(HelloCommand));
     registry.register(Box::new(HelpCommand));
     registry.register(Box::new(NodesCommand::new(handles.clone())));
-    registry.register(Box::new(GetInfoCommand::new(handles)));
+    registry.register(Box::new(GetInfoCommand::new(handles.clone())));
+    registry.register(Box::new(PnpListCommand::new(handles)));
 }
 
 fn repl_loop(registry: CommandRegistry, shutdown_tx: watch::Sender<bool>) {

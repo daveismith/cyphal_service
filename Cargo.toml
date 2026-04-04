@@ -10,6 +10,10 @@ authors = ["Cyphal Service Contributors"]
 name = "cyphal_service"
 path = "src/main.rs"
 
+[lib]
+name = "cyphal_service"
+path = "src/lib.rs"
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1.44", features = ["full"] }
@@ -32,6 +36,7 @@ log = "0.4"
 tracing-log = "0.2"
 rand = "0.8"
 heapless = "0.9"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 canadensis_linux = "0.6.0"

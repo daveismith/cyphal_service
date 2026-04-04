@@ -44,10 +44,22 @@ pub struct CanConfig {
     #[serde(default)]
     #[allow(dead_code)]
     pub fd: bool,
+    /// Enable Plug-and-Play node-ID allocation on this interface. Defaults to true.
+    #[serde(default = "default_pnp_enabled")]
+    #[allow(dead_code)]
+    pub pnp_enabled: bool,
+    /// Path to the PNP allocation SQLite database.
+    /// Defaults to /var/lib/cyphal_service/<name>-allocations.db.
+    #[allow(dead_code)]
+    pub pnp_db_path: Option<String>,
 }
 
 fn default_bitrate() -> u32 {
     1_000_000
+}
+
+fn default_pnp_enabled() -> bool {
+    true
 }
 
 /// Which CAN hardware driver to use.
@@ -71,6 +83,14 @@ pub struct UdpConfig {
     pub interface: String,
     /// UDP port. Defaults to the standard Cyphal UDP port 9382.
     pub port: Option<u16>,
+    /// Enable Plug-and-Play node-ID allocation on this interface. Defaults to true.
+    #[serde(default = "default_pnp_enabled")]
+    #[allow(dead_code)]
+    pub pnp_enabled: bool,
+    /// Path to the PNP allocation SQLite database.
+    /// Defaults to /var/lib/cyphal_service/<name>-allocations.db.
+    #[allow(dead_code)]
+    pub pnp_db_path: Option<String>,
 }
 
 /// Cyphal/Serial transport configuration.
@@ -85,10 +105,28 @@ pub struct SerialConfig {
     /// Serial baud rate. Defaults to 115200.
     #[serde(default = "default_baud_rate")]
     pub baud_rate: u32,
+    /// Enable Plug-and-Play node-ID allocation on this interface. Defaults to true.
+    #[serde(default = "default_pnp_enabled")]
+    #[allow(dead_code)]
+    pub pnp_enabled: bool,
+    /// Path to the PNP allocation SQLite database.
+    /// Defaults to /var/lib/cyphal_service/<name>-allocations.db.
+    #[allow(dead_code)]
+    pub pnp_db_path: Option<String>,
 }
 
 fn default_baud_rate() -> u32 {
     115_200
+}
+
+/// Resolve the effective PNP database path for a transport.
+#[allow(dead_code)]
+pub fn effective_pnp_db_path(name: &str, override_path: Option<&str>) -> std::path::PathBuf {
+    if let Some(p) = override_path {
+        std::path::PathBuf::from(p)
+    } else {
+        std::path::PathBuf::from(format!("/var/lib/cyphal_service/{name}-allocations.db"))
+    }
 }
 
 /// Load and parse a TOML config file.
@@ -178,5 +216,60 @@ baud_rate = 115200
             }
             _ => panic!("Expected Serial transport"),
         }
+    }
+
+    #[test]
+    fn test_pnp_defaults() {
+        let toml = r#"
+[[transport]]
+type      = "udp"
+name      = "udp-primary"
+node_id   = 100
+interface = "127.0.0.1"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        match &cfg.transports[0] {
+            TransportConfig::Udp(u) => {
+                assert!(u.pnp_enabled);
+                assert!(u.pnp_db_path.is_none());
+            }
+            _ => panic!("Expected UDP transport"),
+        }
+    }
+
+    #[test]
+    fn test_pnp_explicit_config() {
+        let toml = r#"
+[[transport]]
+type         = "udp"
+name         = "udp-primary"
+node_id      = 100
+interface    = "127.0.0.1"
+pnp_enabled  = false
+pnp_db_path  = "/tmp/test.db"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        match &cfg.transports[0] {
+            TransportConfig::Udp(u) => {
+                assert!(!u.pnp_enabled);
+                assert_eq!(u.pnp_db_path.as_deref(), Some("/tmp/test.db"));
+            }
+            _ => panic!("Expected UDP transport"),
+        }
+    }
+
+    #[test]
+    fn test_effective_pnp_db_path_default() {
+        let p = effective_pnp_db_path("my-iface", None);
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/var/lib/cyphal_service/my-iface-allocations.db")
+        );
+    }
+
+    #[test]
+    fn test_effective_pnp_db_path_override() {
+        let p = effective_pnp_db_path("my-iface", Some("/tmp/custom.db"));
+        assert_eq!(p, std::path::PathBuf::from("/tmp/custom.db"));
     }
 }

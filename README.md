@@ -86,6 +86,8 @@ classDiagram
 - **Cyphal/CAN** – SocketCAN (Linux) and gs_usb/candleLight USB (all platforms).
 - **Cyphal/UDP** – all platforms.
 - **Cyphal/Serial** – all platforms.
+- **Plug-and-Play node-ID allocation** – built-in PNP allocator per interface,
+  yakut-compatible SQLite database.
 - **macOS support** – foreground/REPL mode works on macOS; CAN via gs_usb.
 - **Graceful shutdown** – handles `SIGTERM` and `SIGINT`.
 - **Configurable log level** via `RUST_LOG` environment variable.
@@ -350,7 +352,91 @@ Transport: can-usb
 
 ---
 
-## Extending with new commands
+## Plug-and-Play node-ID allocation
+
+`cyphal_service` includes a built-in **Plug-and-Play (PNP) node-ID allocator**
+on each configured transport.  The allocator implements the single-allocator
+(non-redundant) PNP algorithm defined in the Cyphal specification.
+
+### How it works
+
+When a new Cyphal node connects to the bus without a statically configured
+node-ID, it broadcasts an anonymous allocation request.  `cyphal_service`
+intercepts these requests and responds with an assigned node-ID, recording
+the mapping in a per-interface SQLite database.
+
+Both allocation message versions are supported:
+| Version | Subject ID | Transport |
+|---------|-----------|-----------|
+| `uavcan.pnp.NodeIDAllocationData.1.0` | 8166 | Classic CAN (7-byte payload) |
+| `uavcan.pnp.NodeIDAllocationData.2.0` | 8165 | CAN FD, UDP, Serial |
+
+Once a unique-ID has been mapped to a node-ID, the same node-ID is always
+returned for subsequent requests from that node (the mapping persists in the
+database).  Static nodes observed via heartbeat are automatically reserved so
+their IDs are never accidentally assigned to PNP nodes.
+
+### Configuration
+
+PNP allocation is **enabled by default** on every interface.  To disable it,
+or to override the database path, add the following optional keys to any
+`[[transport]]` block:
+
+```toml
+[[transport]]
+type        = "udp"
+name        = "udp-primary"
+node_id     = 100
+interface   = "192.168.1.50"
+
+# PNP settings (both optional)
+pnp_enabled = true   # default: true; set false to disable the allocator
+pnp_db_path = "/var/lib/cyphal_service/udp-primary-allocations.db"  # default shown
+```
+
+The default database path is `/var/lib/cyphal_service/<name>-allocations.db`
+where `<name>` is the transport's `name` field.
+
+### Database schema
+
+The allocation database uses a SQLite file with a schema compatible with
+[yakut](https://github.com/OpenCyphal/yakut):
+
+```sql
+CREATE TABLE `allocation` (
+    `node_id`          int not null unique check(node_id >= 0),
+    `unique_id_hex`    varchar(32),
+    `pseudo_unique_id` bigint,
+    `ts`               time not null default current_timestamp,
+    primary key(node_id)
+)
+```
+
+| Column | Description |
+|--------|-------------|
+| `node_id` | Assigned Cyphal node ID |
+| `unique_id_hex` | 32-char lower-case hex of the 128-bit unique ID (v2); or left-zero-padded 48-bit hash (v1) |
+| `pseudo_unique_id` | The 48-bit hash for v1 allocations; `NULL` for v2 and static nodes |
+| `ts` | Timestamp of the allocation |
+
+### REPL command: `pnp-list`
+
+Use `pnp-list` in foreground mode to inspect the allocation table:
+
+```text
+cyphal> pnp-list
+Transport: udp-primary
+  Node ID  Unique ID (hex)                    Pseudo UID           Timestamp
+  100      00000000000000000000000000000000   NULL                 2026-04-04 04:00:00
+  120      ecc2df6646b8fcb7b28df4fc4c67a5f5   NULL                 2026-04-04 04:19:37
+  125      df637882d32c3d2a0000000000000000   11297326196577       2026-04-04 04:03:13
+
+cyphal> pnp-list udp-primary   # filter to a single transport
+```
+
+---
+
+
 
 1. Create `src/commands/<name>.rs` implementing the `Command` trait:
 

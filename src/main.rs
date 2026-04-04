@@ -6,6 +6,7 @@ mod cli;
 mod commands;
 mod config;
 mod daemon;
+mod pnp;
 mod transport;
 
 /// Cyphal Linux Service
