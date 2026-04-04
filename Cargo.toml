@@ -10,6 +10,10 @@ authors = ["Cyphal Service Contributors"]
 name = "cyphal_service"
 path = "src/main.rs"
 
+[lib]
+name = "cyphal_service"
+path = "src/lib.rs"
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1.44", features = ["full"] }

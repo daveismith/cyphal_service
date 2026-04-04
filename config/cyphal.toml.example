@@ -18,6 +18,8 @@
 # node_id   = 42
 # interface = "can0"            # SocketCAN interface name
 # fd        = false
+# pnp_enabled = true            # enable PnP node-ID allocation (default: true)
+# pnp_db_path = "/var/lib/cyphal_service/can-socketcan-allocations.db"  # optional override
 
 # ── CAN via gs_usb / candleLight USB ──────────────────────────────────────────
 # Works on Linux and macOS without any kernel module.
@@ -34,6 +36,8 @@
 # usb_index = 0                 # 0 = first matching device
 # bitrate   = 1000000           # bit/s (default: 1 000 000)
 # fd        = false
+# pnp_enabled = true            # enable PnP node-ID allocation (default: true)
+# pnp_db_path = "/var/lib/cyphal_service/can-usb-allocations.db"  # optional override
 #
 # Optional VID/PID override (default: candleLight 0x1d50/0x606f):
 # vid       = "0x1d50"
@@ -48,6 +52,8 @@
 # node_id   = 100
 # interface = "192.168.1.50"    # local interface IP address to bind to
 # port      = 9382              # optional (default: 9382)
+# pnp_enabled = true            # enable PnP node-ID allocation (default: true)
+# pnp_db_path = "/var/lib/cyphal_service/udp-primary-allocations.db"  # optional override
 
 # ── Cyphal/Serial ─────────────────────────────────────────────────────────────
 # Works on Linux and macOS.
@@ -58,6 +64,8 @@
 # node_id   = 200
 # port      = "/dev/ttyUSB0"    # "/dev/cu.usbmodem…" on macOS
 # baud_rate = 115200            # optional (default: 115200)
+# pnp_enabled = true            # enable PnP node-ID allocation (default: true)
+# pnp_db_path = "/var/lib/cyphal_service/serial-primary-allocations.db"  # optional override
 
 # ── Minimal working example (uncomment to use) ────────────────────────────────
 
