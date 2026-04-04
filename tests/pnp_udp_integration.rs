@@ -408,8 +408,10 @@ fn test_v1_node_heartbeat_enqueues_get_info() {
 
 #[test]
 fn test_get_info_result_updates_db() {
-    // After a successful GetInfo response the DB entry must carry the full
-    // unique ID and must no longer require another GetInfo.
+    // After a successful GetInfo response the DB entry (here a static node)
+    // must carry the full unique ID and must no longer require another GetInfo.
+    // Static nodes never have a pseudo_unique_id, so it stays None after the
+    // update.
     let (mut alloc, path) = open_allocator("gi_update", 100, 127);
 
     alloc.on_heartbeat(7);
@@ -429,13 +431,79 @@ fn test_get_info_result_updates_db() {
         entry.unique_id_hex, expected_hex,
         "full unique ID must be stored"
     );
+    // Static node: pseudo_unique_id was never set, so it stays None.
     assert!(
         entry.pseudo_unique_id.is_none(),
-        "pseudo_unique_id must be cleared"
+        "static node has no pseudo_unique_id before or after update"
     );
     assert!(
         !entry.needs_get_info(),
         "entry must not require GetInfo after update"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_v1_node_hash_preserved_after_get_info() {
+    // The v1 hash (pseudo_unique_id) must be preserved after GetInfo resolves
+    // the real unique ID.  Without it, a rebooting v1 node would be assigned a
+    // different node ID because find_by_hash would no longer find the entry.
+    let (mut alloc, path) = open_allocator("gi_v1_hash", 100, 127);
+
+    let hash: u64 = 0x00_ABCD_EF12_3456;
+    alloc.on_allocation_v1(&v1_request(hash), None).unwrap();
+
+    let entries = alloc.list_allocations();
+    let v1_entry = entries
+        .iter()
+        .find(|e| e.pseudo_unique_id.is_some())
+        .unwrap();
+    let v1_node_id = v1_entry.node_id;
+
+    // Node comes online, heartbeat triggers GetInfo enqueue.
+    alloc.on_heartbeat(v1_node_id);
+    assert_eq!(alloc.pop_get_info_request(), Some(v1_node_id));
+
+    // GetInfo succeeds — real unique ID is now known.
+    let uid: [u8; 16] = [
+        0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+        0x0a,
+    ];
+    alloc.on_get_info_result(v1_node_id, Some(uid));
+
+    let db = cyphal_service::pnp::AllocationDb::open(&path).unwrap();
+    let entry = db.find_by_node_id(v1_node_id).expect("v1 node must exist");
+
+    // unique_id_hex is now the real value.
+    let expected_hex: String = uid.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(
+        entry.unique_id_hex, expected_hex,
+        "unique_id_hex must be updated to the real value"
+    );
+
+    // pseudo_unique_id must still be set so find_by_hash works on reboot.
+    assert_eq!(
+        entry.pseudo_unique_id,
+        Some(hash as i64),
+        "pseudo_unique_id must be preserved so the node gets the same ID on reboot"
+    );
+
+    // GetInfo must not be re-triggered on subsequent heartbeats.
+    assert!(
+        !entry.needs_get_info(),
+        "resolved v1 node must not require another GetInfo"
+    );
+
+    // Simulate reboot: node sends a new v1 PNP allocation request with the
+    // same hash.  It must receive the SAME node ID as before.
+    let resp = alloc
+        .on_allocation_v1(&v1_request(hash), None)
+        .expect("reboot allocation must succeed");
+    let reallocated_id = v1_allocated_id(&resp);
+    assert_eq!(
+        reallocated_id, v1_node_id,
+        "node must receive the same ID after reboot"
     );
 
     let _ = std::fs::remove_file(&path);
