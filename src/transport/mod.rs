@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use canadensis_core::time::{Clock, Microseconds32};
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::config::{AppConfig, CanDriver, TransportConfig};
 
@@ -344,7 +344,7 @@ pub async fn start_all(
                     }
                     #[cfg(not(target_os = "linux"))]
                     {
-                        error!(
+                        warn!(
                             transport = %cfg.name,
                             "SocketCAN is not supported on this platform – skipping transport"
                         );
