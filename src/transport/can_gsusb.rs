@@ -36,7 +36,7 @@ use canadensis_data_types::uavcan::node::get_info_1_0::{
 };
 use canadensis_data_types::uavcan::node::heartbeat_1_0::{Heartbeat, SUBJECT as HEARTBEAT_SUBJECT};
 use canadensis_encoding::Deserialize;
-use rusb::{DeviceHandle, GlobalContext, UsbContext};
+use rusb::{Device, DeviceHandle, Direction, GlobalContext, TransferType, UsbContext};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
@@ -47,14 +47,19 @@ use crate::transport::{
 
 // ─── GS-USB protocol constants ───────────────────────────────────────────────
 
-const GS_USB_REQ_HOST_FORMAT: u8 = 0x40; // bmRequestType: host-to-device, class, interface
-const GS_USB_REQ_DEVICE_FORMAT: u8 = 0xC0; // bmRequestType: device-to-host, class, interface
+const USB_REQ_OUT_VENDOR_DEVICE: u8 = 0x40;
+const USB_REQ_IN_VENDOR_DEVICE: u8 = 0xC0;
+const USB_REQ_OUT_VENDOR_INTERFACE: u8 = 0x41;
+const USB_REQ_IN_VENDOR_INTERFACE: u8 = 0xC1;
 
+const GS_USB_BREQ_HOST_FORMAT: u8 = 0;
 const GS_USB_BREQ_SET_BITTIMING: u8 = 1;
-const GS_USB_BREQ_SET_MODE: u8 = 3;
+const GS_USB_BREQ_SET_MODE: u8 = 2;
 const GS_USB_BREQ_BT_CONST: u8 = 4;
+const GS_USB_BREQ_DEVICE_CONFIG: u8 = 5;
 
-const GS_CAN_MODE_NORMAL: u32 = 0;
+const GS_CAN_MODE_RESET: u32 = 0;
+const GS_CAN_MODE_START: u32 = 1;
 
 const GS_CAN_EFF_FLAG: u32 = 0x8000_0000; // extended frame format (29-bit ID)
 const GS_CAN_RTR_FLAG: u32 = 0x4000_0000; // remote transmission request
@@ -64,10 +69,17 @@ const GS_HOST_FRAME_SIZE: usize = 20; // echo_id(4) + can_id(4) + dlc(1) + chann
 
 const BULK_IN_ENDPOINT: u8 = 0x81;
 const BULK_OUT_ENDPOINT: u8 = 0x01;
+const BULK_OUT_ENDPOINT_ALT: u8 = 0x02;
+const GS_USB_HOST_CONFIG_BYTE_ORDER: u32 = 0x0000_beef;
 
 /// Known VID/PID pairs for candleLight-compatible adapters.
 const CANDLELIGHT_DEVICES: &[(u16, u16)] = &[
     (0x1d50, 0x606f), // CANable / candleLight firmware
+    (0x1209, 0x2323), // candleLight firmware (pid.codes)
+    (0x1209, 0xca01), // CANnectivity
+    (0x1cd2, 0x606f), // CES CANext FD
+    (0x16d0, 0x10b8), // ABE CANdebugger FD
+    (0x16d0, 0x0f30), // Xylanta SAINT3
     (0x1d50, 0x5740), // CANable Pro
     (0x04d8, 0x0053), // Microchip CAN Bus Analyzer
 ];
@@ -106,6 +118,30 @@ struct GsDeviceMode {
     flags: u32,
 }
 
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+struct GsHostConfig {
+    byte_order: u32,
+}
+
+#[repr(C, packed)]
+#[derive(Copy, Clone, Default)]
+struct GsDeviceConfig {
+    reserved1: u8,
+    reserved2: u8,
+    reserved3: u8,
+    icount: u8,
+    sw_version: u32,
+    hw_version: u32,
+}
+
+#[derive(Copy, Clone)]
+struct GsUsbInterfaceInfo {
+    interface_number: u8,
+    bulk_in_endpoint: u8,
+    bulk_out_endpoint: u8,
+}
+
 // ─── GsUsbDriver ─────────────────────────────────────────────────────────────
 
 /// Error type for the gs_usb driver.
@@ -114,6 +150,10 @@ pub enum GsUsbError {
     Usb(rusb::Error),
     InvalidFrame,
     UnsupportedBitrate(u32),
+    ProtocolStep {
+        step: &'static str,
+        source: rusb::Error,
+    },
 }
 
 impl fmt::Display for GsUsbError {
@@ -122,6 +162,9 @@ impl fmt::Display for GsUsbError {
             GsUsbError::Usb(e) => write!(f, "USB error: {e}"),
             GsUsbError::InvalidFrame => write!(f, "Invalid CAN frame"),
             GsUsbError::UnsupportedBitrate(br) => write!(f, "Unsupported bitrate: {br}"),
+            GsUsbError::ProtocolStep { step, source } => {
+                write!(f, "USB error during {step}: {source}")
+            }
         }
     }
 }
@@ -136,6 +179,9 @@ impl From<rusb::Error> for GsUsbError {
 pub struct GsUsbDriver {
     handle: DeviceHandle<GlobalContext>,
     channel: u8,
+    interface_number: u8,
+    bulk_in_endpoint: u8,
+    bulk_out_endpoint: u8,
     echo_counter: u32,
 }
 
@@ -182,6 +228,8 @@ impl GsUsbDriver {
             .nth(index as usize)
             .ok_or(rusb::Error::NotFound)?;
 
+        let interface = find_gsusb_interface(&device)?;
+
         let handle = device.open()?;
 
         // Detach any existing kernel driver (Linux only – no-op on macOS).
@@ -192,41 +240,182 @@ impl GsUsbDriver {
             }
         }
 
-        handle.claim_interface(0)?;
+        handle.claim_interface(interface.interface_number)?;
 
-        let driver = GsUsbDriver {
+        let mut driver = GsUsbDriver {
             handle,
             channel: 0,
+            interface_number: interface.interface_number,
+            bulk_in_endpoint: interface.bulk_in_endpoint,
+            bulk_out_endpoint: interface.bulk_out_endpoint,
             echo_counter: 0,
         };
 
+        driver.clear_halt_conditions()?;
+
+        driver
+            .configure_host_format()
+            .map_err(|source| GsUsbError::ProtocolStep {
+                step: "host format negotiation",
+                source: source.into_usb_error(),
+            })?;
+        let device_config =
+            driver
+                .read_device_config()
+                .map_err(|source| GsUsbError::ProtocolStep {
+                    step: "device configuration read",
+                    source: source.into_usb_error(),
+                })?;
+        let channel_count = device_config.icount.saturating_add(1);
+        let sw_version = device_config.sw_version;
+        let hw_version = device_config.hw_version;
+        debug!(
+            interface = driver.interface_number,
+            channels = channel_count,
+            sw_version,
+            hw_version,
+            "Opened gs_usb device configuration"
+        );
+
         // Query device capabilities and compute bittiming.
-        let bt_const = driver.read_bt_const()?;
+        let bt_const = driver
+            .read_bt_const()
+            .map_err(|source| GsUsbError::ProtocolStep {
+                step: "bit timing constants read",
+                source: source.into_usb_error(),
+            })?;
+        driver
+            .set_mode(GS_CAN_MODE_RESET)
+            .map_err(|source| GsUsbError::ProtocolStep {
+                step: "reset mode configuration",
+                source: source.into_usb_error(),
+            })?;
         let timing =
             compute_bittiming(bitrate, &bt_const).ok_or(GsUsbError::UnsupportedBitrate(bitrate))?;
-        driver.set_bittiming(&timing)?;
+        driver
+            .set_bittiming(&timing)
+            .map_err(|source| GsUsbError::ProtocolStep {
+                step: "bit timing configuration",
+                source: source.into_usb_error(),
+            })?;
 
         // Put the device into normal operating mode.
-        driver.set_mode(GS_CAN_MODE_NORMAL)?;
+        driver
+            .set_mode(GS_CAN_MODE_START)
+            .map_err(|source| GsUsbError::ProtocolStep {
+                step: "normal mode configuration",
+                source: source.into_usb_error(),
+            })?;
 
         info!("Opened gs_usb CAN adapter, bitrate={} bit/s", bitrate);
         Ok(driver)
     }
 
-    fn read_bt_const(&self) -> Result<GsDeviceBtConst, GsUsbError> {
-        let mut buf = [0u8; std::mem::size_of::<GsDeviceBtConst>()];
+    fn clear_halt_conditions(&mut self) -> Result<(), GsUsbError> {
+        self.handle.clear_halt(self.bulk_in_endpoint)?;
+        self.handle.clear_halt(self.bulk_out_endpoint)?;
+        Ok(())
+    }
+
+    fn write_control_candidates(
+        &self,
+        request: u8,
+        candidates: &[(u8, u16, u16)],
+        data: &[u8],
+    ) -> Result<(), GsUsbError> {
         let timeout = Duration::from_millis(500);
-        let n = self.handle.read_control(
-            GS_USB_REQ_DEVICE_FORMAT,
-            GS_USB_BREQ_BT_CONST,
-            0,
-            self.channel as u16,
-            &mut buf,
-            timeout,
-        )?;
-        if n < buf.len() {
-            return Err(rusb::Error::Other.into());
+        let mut last_error = None;
+
+        for &(request_type, value, index) in candidates {
+            match self
+                .handle
+                .write_control(request_type, request, value, index, data, timeout)
+            {
+                Ok(_) => return Ok(()),
+                Err(rusb::Error::Pipe) => last_error = Some(rusb::Error::Pipe),
+                Err(error) => return Err(error.into()),
+            }
         }
+
+        Err(last_error.unwrap_or(rusb::Error::Other).into())
+    }
+
+    fn read_control_candidates<const N: usize>(
+        &self,
+        request: u8,
+        candidates: &[(u8, u16, u16)],
+    ) -> Result<[u8; N], GsUsbError> {
+        let timeout = Duration::from_millis(500);
+        let mut last_error = None;
+
+        for &(request_type, value, index) in candidates {
+            let mut buf = [0u8; N];
+            match self
+                .handle
+                .read_control(request_type, request, value, index, &mut buf, timeout)
+            {
+                Ok(n) if n >= N => return Ok(buf),
+                Ok(_) => return Err(rusb::Error::Other.into()),
+                Err(rusb::Error::Pipe) => last_error = Some(rusb::Error::Pipe),
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Err(last_error.unwrap_or(rusb::Error::Other).into())
+    }
+
+    fn configure_host_format(&mut self) -> Result<(), GsUsbError> {
+        let host_config = GsHostConfig {
+            byte_order: GS_USB_HOST_CONFIG_BYTE_ORDER,
+        };
+        let buf = host_config.byte_order.to_le_bytes();
+        self.write_control_candidates(
+            GS_USB_BREQ_HOST_FORMAT,
+            &[
+                (USB_REQ_OUT_VENDOR_INTERFACE, 0, 0),
+                (
+                    USB_REQ_OUT_VENDOR_INTERFACE,
+                    0,
+                    self.interface_number as u16,
+                ),
+                (USB_REQ_OUT_VENDOR_DEVICE, 0, self.interface_number as u16),
+                (USB_REQ_OUT_VENDOR_DEVICE, 0, 0),
+            ],
+            &buf,
+        )?;
+        Ok(())
+    }
+
+    fn read_device_config(&self) -> Result<GsDeviceConfig, GsUsbError> {
+        let buf = self.read_control_candidates::<{ std::mem::size_of::<GsDeviceConfig>() }>(
+            GS_USB_BREQ_DEVICE_CONFIG,
+            &[
+                (USB_REQ_IN_VENDOR_INTERFACE, 0, 0),
+                (USB_REQ_IN_VENDOR_INTERFACE, 0, self.interface_number as u16),
+                (USB_REQ_IN_VENDOR_DEVICE, 0, self.interface_number as u16),
+                (USB_REQ_IN_VENDOR_DEVICE, 0, 0),
+            ],
+        )?;
+        Ok(GsDeviceConfig {
+            reserved1: buf[0],
+            reserved2: buf[1],
+            reserved3: buf[2],
+            icount: buf[3],
+            sw_version: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            hw_version: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+        })
+    }
+
+    fn read_bt_const(&self) -> Result<GsDeviceBtConst, GsUsbError> {
+        let buf = self.read_control_candidates::<{ std::mem::size_of::<GsDeviceBtConst>() }>(
+            GS_USB_BREQ_BT_CONST,
+            &[
+                (USB_REQ_IN_VENDOR_INTERFACE, self.channel as u16, 0),
+                (USB_REQ_IN_VENDOR_DEVICE, self.channel as u16, 0),
+                (USB_REQ_IN_VENDOR_DEVICE, 0, self.channel as u16),
+                (USB_REQ_IN_VENDOR_INTERFACE, 0, self.channel as u16),
+            ],
+        )?;
         // Safety: we own `buf` and all bit patterns are valid for this struct.
         Ok(unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const GsDeviceBtConst) })
     }
@@ -234,13 +423,15 @@ impl GsUsbDriver {
     fn set_bittiming(&self, timing: &GsDeviceBittiming) -> Result<(), GsUsbError> {
         let buf: [u8; std::mem::size_of::<GsDeviceBittiming>()] =
             unsafe { std::mem::transmute(*timing) };
-        self.handle.write_control(
-            GS_USB_REQ_HOST_FORMAT,
+        self.write_control_candidates(
             GS_USB_BREQ_SET_BITTIMING,
-            0,
-            self.channel as u16,
+            &[
+                (USB_REQ_OUT_VENDOR_INTERFACE, self.channel as u16, 0),
+                (USB_REQ_OUT_VENDOR_DEVICE, self.channel as u16, 0),
+                (USB_REQ_OUT_VENDOR_DEVICE, 0, self.channel as u16),
+                (USB_REQ_OUT_VENDOR_INTERFACE, 0, self.channel as u16),
+            ],
             &buf,
-            Duration::from_millis(500),
         )?;
         Ok(())
     }
@@ -249,13 +440,15 @@ impl GsUsbDriver {
         let gs_mode = GsDeviceMode { mode, flags: 0 };
         let buf: [u8; std::mem::size_of::<GsDeviceMode>()] =
             unsafe { std::mem::transmute(gs_mode) };
-        self.handle.write_control(
-            GS_USB_REQ_HOST_FORMAT,
+        self.write_control_candidates(
             GS_USB_BREQ_SET_MODE,
-            0,
-            self.channel as u16,
+            &[
+                (USB_REQ_OUT_VENDOR_INTERFACE, self.channel as u16, 0),
+                (USB_REQ_OUT_VENDOR_DEVICE, self.channel as u16, 0),
+                (USB_REQ_OUT_VENDOR_DEVICE, 0, self.channel as u16),
+                (USB_REQ_OUT_VENDOR_INTERFACE, 0, self.channel as u16),
+            ],
             &buf,
-            Duration::from_millis(500),
         )?;
         Ok(())
     }
@@ -306,6 +499,23 @@ impl GsUsbDriver {
     }
 }
 
+impl GsUsbError {
+    fn into_usb_error(self) -> rusb::Error {
+        match self {
+            GsUsbError::Usb(error) => error,
+            GsUsbError::ProtocolStep { source, .. } => source,
+            _ => rusb::Error::Other,
+        }
+    }
+}
+
+impl Drop for GsUsbDriver {
+    fn drop(&mut self) {
+        let _ = self.set_mode(GS_CAN_MODE_RESET);
+        let _ = self.handle.release_interface(self.interface_number);
+    }
+}
+
 impl TransmitDriver<SystemClock> for GsUsbDriver {
     type Error = GsUsbError;
 
@@ -328,7 +538,7 @@ impl TransmitDriver<SystemClock> for GsUsbDriver {
         let buf = Self::encode_frame(&frame, echo_id);
         match self
             .handle
-            .write_bulk(BULK_OUT_ENDPOINT, &buf, Duration::from_millis(100))
+            .write_bulk(self.bulk_out_endpoint, &buf, Duration::from_millis(100))
         {
             Ok(_) => Ok(None),
             Err(rusb::Error::Timeout) => Err(nb::Error::WouldBlock),
@@ -351,7 +561,7 @@ impl ReceiveDriver<SystemClock> for GsUsbDriver {
         let mut buf = [0u8; GS_HOST_FRAME_SIZE];
         match self
             .handle
-            .read_bulk(BULK_IN_ENDPOINT, &mut buf, Duration::from_millis(1))
+            .read_bulk(self.bulk_in_endpoint, &mut buf, Duration::from_millis(1))
         {
             Ok(_) => {
                 let now = clock.now();
@@ -373,6 +583,85 @@ impl ReceiveDriver<SystemClock> for GsUsbDriver {
     fn apply_accept_all(&mut self) {
         // Already accepting all frames; nothing to do.
     }
+}
+
+fn find_gsusb_interface(device: &Device<GlobalContext>) -> Result<GsUsbInterfaceInfo, GsUsbError> {
+    let config = device.active_config_descriptor()?;
+
+    // Prefer vendor-specific interfaces with expected GS-USB endpoints.
+    for interface in config.interfaces() {
+        for descriptor in interface.descriptors() {
+            if descriptor.class_code() != 0xff {
+                continue;
+            }
+
+            let mut bulk_in_endpoint = None;
+            let mut bulk_out_endpoint = None;
+
+            for endpoint in descriptor.endpoint_descriptors() {
+                if endpoint.transfer_type() != TransferType::Bulk {
+                    continue;
+                }
+
+                match endpoint.direction() {
+                    Direction::In if endpoint.address() == BULK_IN_ENDPOINT => {
+                        bulk_in_endpoint = Some(endpoint.address())
+                    }
+                    Direction::Out
+                        if endpoint.address() == BULK_OUT_ENDPOINT
+                            || endpoint.address() == BULK_OUT_ENDPOINT_ALT =>
+                    {
+                        bulk_out_endpoint = Some(endpoint.address())
+                    }
+                    _ => {}
+                }
+            }
+
+            if let (Some(bulk_in_endpoint), Some(bulk_out_endpoint)) =
+                (bulk_in_endpoint, bulk_out_endpoint)
+            {
+                return Ok(GsUsbInterfaceInfo {
+                    interface_number: descriptor.interface_number(),
+                    bulk_in_endpoint,
+                    bulk_out_endpoint,
+                });
+            }
+        }
+    }
+
+    for interface in config.interfaces() {
+        for descriptor in interface.descriptors() {
+            let mut bulk_in_endpoint = None;
+            let mut bulk_out_endpoint = None;
+
+            for endpoint in descriptor.endpoint_descriptors() {
+                if endpoint.transfer_type() != TransferType::Bulk {
+                    continue;
+                }
+
+                match endpoint.direction() {
+                    Direction::In => bulk_in_endpoint = Some(endpoint.address()),
+                    Direction::Out => bulk_out_endpoint = Some(endpoint.address()),
+                }
+            }
+
+            if let (Some(bulk_in_endpoint), Some(bulk_out_endpoint)) =
+                (bulk_in_endpoint, bulk_out_endpoint)
+            {
+                return Ok(GsUsbInterfaceInfo {
+                    interface_number: descriptor.interface_number(),
+                    bulk_in_endpoint,
+                    bulk_out_endpoint,
+                });
+            }
+        }
+    }
+
+    Ok(GsUsbInterfaceInfo {
+        interface_number: 0,
+        bulk_in_endpoint: BULK_IN_ENDPOINT,
+        bulk_out_endpoint: BULK_OUT_ENDPOINT_ALT,
+    })
 }
 
 // ─── Bittiming calculation ────────────────────────────────────────────────────
@@ -446,6 +735,7 @@ pub fn start(cfg: CanConfig, shutdown: watch::Receiver<bool>) -> TransportHandle
 
     let name = cfg.name.clone();
     let name_clone = name.clone();
+    let local_node_id = u16::from(cfg.node_id);
 
     tokio::task::spawn_blocking(move || {
         run_worker(cfg, cmd_rx, shutdown);
@@ -453,6 +743,7 @@ pub fn start(cfg: CanConfig, shutdown: watch::Receiver<bool>) -> TransportHandle
 
     TransportHandle {
         name: name_clone,
+        local_node_id: Some(local_node_id),
         cmd_tx,
     }
 }
@@ -523,6 +814,7 @@ fn run_worker(
         .ok();
 
     let mut state = WorkerState::default();
+    state.register_local_node(u16::from(cfg.node_id));
     let mut last_second = Instant::now();
 
     info!(transport = %name, "gs_usb CAN worker started");
@@ -535,7 +827,14 @@ fn run_worker(
 
         // Process pending commands.
         while let Ok(cmd) = cmd_rx.try_recv() {
-            handle_command(cmd, &mut node, &get_info_token, &mut state, &name);
+            handle_command(
+                cmd,
+                &mut node,
+                &get_info_token,
+                &mut state,
+                &name,
+                cfg.node_id,
+            );
         }
 
         // Check for timed-out GetInfo requests.
@@ -547,12 +846,16 @@ fn run_worker(
             Ok(_) => {}
             Err(CanError::Driver(GsUsbError::Usb(rusb::Error::Timeout)))
             | Err(CanError::Driver(GsUsbError::Usb(rusb::Error::NoDevice))) => {}
-            Err(e) => warn!(transport = %name, "Receive error: {e:?}"),
+            Err(e) => {
+                state.record_error(format!("Receive error: {e:?}"));
+                warn!(transport = %name, "Receive error: {e:?}");
+            }
         }
 
         // Run per-second tasks.
         if last_second.elapsed() >= Duration::from_secs(1) {
             last_second = Instant::now();
+            state.tick_local_node(u16::from(cfg.node_id));
             if let Err(e) = node.run_per_second_tasks() {
                 debug!(transport = %name, "Per-second task error: {e:?}");
             }
@@ -571,10 +874,14 @@ fn handle_command(
     token: &Option<ServiceToken<GetInfoRequest>>,
     state: &mut WorkerState,
     _name: &str,
+    local_node_id: u8,
 ) {
     match cmd {
         TransportCommand::ListNodes { reply } => {
             let _ = reply.send(state.node_list());
+        }
+        TransportCommand::Diagnostics { reply } => {
+            let _ = reply.send(state.diagnostics(Some(u16::from(local_node_id))));
         }
         TransportCommand::GetInfo { node_id, reply } => {
             if node_id > 127 {
@@ -593,6 +900,7 @@ fn handle_command(
             if let Some(token) = token {
                 match node.send_request(token, &GetInfoRequest {}, target) {
                     Ok(_) => {
+                        state.on_get_info_request_sent();
                         state.pending_get_info = Some(PendingGetInfo {
                             node_id,
                             reply,
@@ -600,10 +908,12 @@ fn handle_command(
                         });
                     }
                     Err(e) => {
+                        state.record_error(format!("GetInfo request send failed: {e:?}"));
                         let _ = reply.send(Err(format!("Failed to send GetInfo request: {e:?}")));
                     }
                 }
             } else {
+                state.record_error("GetInfo requester not available");
                 let _ = reply.send(Err("GetInfo requester not available".into()));
             }
         }
@@ -656,6 +966,7 @@ impl<'a> TransferHandler<CanTransport> for GsUsbHandler<'a> {
             }),
             Err(_) => Err("Failed to parse GetInfo response".into()),
         };
+        self.state.on_message_received();
         self.state.on_get_info_response(result);
         true
     }

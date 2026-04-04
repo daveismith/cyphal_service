@@ -212,6 +212,11 @@ cyphal> quit
 Goodbye.
 ```
 
+`nodes` now includes the local transport node immediately after startup. This
+does not depend on heartbeat loopback support from the underlying transport or
+USB adapter, so repeated foreground runs should still show the service's own
+node ID.
+
 ---
 
 ## Running as a systemd service
@@ -262,7 +267,7 @@ type     = "can"
 name     = "can-usb"
 driver   = "gsusb"
 node_id  = 42
-bitrate  = 1000000
+bitrate  = 1000000  # must match the live CAN bus bitrate exactly
 
 # CAN via Linux SocketCAN (Linux only)
 [[transport]]
@@ -313,12 +318,33 @@ EOF
 cargo run -- --foreground --config ~/cyphal.toml
 ```
 
+When the service starts, `nodes` should show the configured local node even if
+there are no other nodes on the bus yet:
+
+```text
+cyphal> nodes
+Transport: can-usb
+    Node ID  Uptime(s)  Health     Mode
+    42       0          0          0
+```
+
 > **Note (Linux):** The `gs_usb` kernel module and the `gsusb` driver
 > conflict.  Before using `driver = "gsusb"`, unload the module:
 > `sudo rmmod gs_usb`
 
 > **Note (macOS):** If a KEXT from another USB CAN tool is loaded, unload it
 > before running cyphal_service.
+
+> **Note (bus visibility):** Remote nodes such as node `125` will only appear
+> if the configured `bitrate` matches the actual CAN bus bitrate. A healthy
+> local `can-usb` node with no remote nodes listed usually means either there
+> is no traffic on the bus yet, or the adapter is listening at the wrong rate.
+
+> **Note (tool handoff):** `cyphal_service` now resets the gs_usb channel and
+> clears stalled bulk endpoints on startup and shutdown so it can recover more
+> reliably after other CAN tools have used the adapter. If another tool still
+> keeps the device claimed or leaves the adapter wedged, unplugging and
+> reconnecting the USB adapter is still the final fallback.
 
 ---
 

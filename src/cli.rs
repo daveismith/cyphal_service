@@ -7,6 +7,7 @@ use tracing::info;
 
 use crate::commands::{
     CommandRegistry,
+    diag::DiagCommand,
     get_info::GetInfoCommand,
     hello::HelloCommand,
     help::{HelpCommand, format_help},
@@ -50,6 +51,7 @@ pub async fn run(config: AppConfig) {
 
 /// Register all built-in commands into the registry.
 pub fn register_defaults(registry: &mut CommandRegistry, handles: Arc<Vec<TransportHandle>>) {
+    registry.register(Box::new(DiagCommand::new(handles.clone())));
     registry.register(Box::new(HelloCommand));
     registry.register(Box::new(HelpCommand));
     registry.register(Box::new(NodesCommand::new(handles.clone())));

@@ -11,13 +11,13 @@ pub mod can_socketcan;
 pub mod serial;
 pub mod udp;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use canadensis_core::time::{Clock, Microseconds32};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::{AppConfig, CanDriver, TransportConfig};
 
@@ -46,6 +46,21 @@ pub struct GetInfoResult {
     pub unique_id: [u8; 16],
 }
 
+/// Snapshot of per-transport diagnostic state.
+#[derive(Debug, Clone)]
+pub struct TransportDiagnostics {
+    pub local_node_id: Option<u16>,
+    pub observed_node_count: usize,
+    pub total_messages_received: u64,
+    pub heartbeat_messages_received: u64,
+    pub get_info_requests_sent: u64,
+    pub get_info_responses_received: u64,
+    pub recent_heartbeat_sources: Vec<u16>,
+    pub last_message_age: Option<Duration>,
+    pub last_heartbeat_age: Option<Duration>,
+    pub last_error: Option<String>,
+}
+
 /// Commands sent from the REPL to a transport worker thread.
 pub enum TransportCommand {
     /// Request the list of nodes observed via heartbeats.
@@ -57,6 +72,10 @@ pub enum TransportCommand {
         node_id: u16,
         reply: mpsc::SyncSender<Result<GetInfoResult, String>>,
     },
+    /// Request diagnostic information about the transport worker.
+    Diagnostics {
+        reply: mpsc::SyncSender<TransportDiagnostics>,
+    },
 }
 
 /// Handle to a running transport worker.
@@ -66,6 +85,7 @@ pub enum TransportCommand {
 pub struct TransportHandle {
     /// Human-readable name matching the config `name` field.
     pub name: String,
+    local_node_id: Option<u16>,
     cmd_tx: mpsc::SyncSender<TransportCommand>,
 }
 
@@ -80,7 +100,18 @@ impl TransportHandle {
         {
             return Vec::new();
         }
-        rx.recv_timeout(timeout).unwrap_or_default()
+        let mut nodes = rx.recv_timeout(timeout).unwrap_or_default();
+        if let Some(local_node_id) = self.local_node_id
+            && !nodes.iter().any(|node| node.node_id == local_node_id)
+        {
+            nodes.push(NodeEntry {
+                node_id: local_node_id,
+                uptime: 0,
+                health: 0,
+                mode: 0,
+            });
+        }
+        nodes
     }
 
     /// Send a GetInfo request to `node_id` (blocks up to `timeout`).
@@ -95,6 +126,26 @@ impl TransportHandle {
         }
         rx.recv_timeout(timeout)
             .unwrap_or_else(|_| Err("timed out waiting for GetInfo response".into()))
+    }
+
+    /// Collect transport diagnostics (blocks up to `timeout`).
+    pub fn diagnostics(&self, timeout: Duration) -> Result<TransportDiagnostics, String> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        if self
+            .cmd_tx
+            .send(TransportCommand::Diagnostics { reply: tx })
+            .is_err()
+        {
+            return Err("transport worker has stopped".into());
+        }
+
+        let mut diagnostics = rx
+            .recv_timeout(timeout)
+            .map_err(|_| "timed out waiting for diagnostics".to_string())?;
+        if diagnostics.local_node_id.is_none() {
+            diagnostics.local_node_id = self.local_node_id;
+        }
+        Ok(diagnostics)
     }
 }
 
@@ -138,6 +189,22 @@ pub struct WorkerState {
     pub observed_nodes: HashMap<u16, NodeEntry>,
     /// Pending GetInfo request, if any.
     pub pending_get_info: Option<PendingGetInfo>,
+    /// Total successfully decoded Cyphal messages seen on the transport.
+    pub total_messages_received: u64,
+    /// Number of successfully decoded Heartbeat messages seen on the transport.
+    pub heartbeat_messages_received: u64,
+    /// Number of GetInfo requests issued by this transport worker.
+    pub get_info_requests_sent: u64,
+    /// Number of GetInfo responses received by this transport worker.
+    pub get_info_responses_received: u64,
+    /// Recent heartbeat source node IDs in order of arrival.
+    pub recent_heartbeat_sources: VecDeque<u16>,
+    /// Last time any Cyphal message was successfully decoded.
+    pub last_message_at: Option<Instant>,
+    /// Last time a heartbeat was received.
+    pub last_heartbeat_at: Option<Instant>,
+    /// Most recent worker error message, if any.
+    pub last_error: Option<String>,
 }
 
 /// An in-progress GetInfo request.
@@ -151,8 +218,36 @@ pub struct PendingGetInfo {
 }
 
 impl WorkerState {
+    /// Register the local node so it appears in the node list even when the
+    /// transport does not loop back its own heartbeat frames.
+    pub fn register_local_node(&mut self, node_id: u16) {
+        self.observed_nodes.entry(node_id).or_insert(NodeEntry {
+            node_id,
+            uptime: 0,
+            health: 0,
+            mode: 0,
+        });
+    }
+
+    /// Advance the local node uptime once per second.
+    pub fn tick_local_node(&mut self, node_id: u16) {
+        self.register_local_node(node_id);
+        if let Some(node) = self.observed_nodes.get_mut(&node_id) {
+            node.uptime = node.uptime.saturating_add(1);
+        }
+    }
+
     /// Process an incoming heartbeat from `node_id`.
     pub fn on_heartbeat(&mut self, node_id: u16, uptime: u32, health: u8, mode: u8) {
+        let now = Instant::now();
+        self.total_messages_received = self.total_messages_received.saturating_add(1);
+        self.heartbeat_messages_received = self.heartbeat_messages_received.saturating_add(1);
+        self.last_message_at = Some(now);
+        self.last_heartbeat_at = Some(now);
+        self.recent_heartbeat_sources.push_back(node_id);
+        while self.recent_heartbeat_sources.len() > 8 {
+            self.recent_heartbeat_sources.pop_front();
+        }
         self.observed_nodes.insert(
             node_id,
             NodeEntry {
@@ -166,9 +261,26 @@ impl WorkerState {
 
     /// Provide a completed GetInfo result.
     pub fn on_get_info_response(&mut self, result: Result<GetInfoResult, String>) {
+        self.get_info_responses_received = self.get_info_responses_received.saturating_add(1);
         if let Some(pending) = self.pending_get_info.take() {
             let _ = pending.reply.send(result);
         }
+    }
+
+    /// Record a successful outbound GetInfo request.
+    pub fn on_get_info_request_sent(&mut self) {
+        self.get_info_requests_sent = self.get_info_requests_sent.saturating_add(1);
+    }
+
+    /// Record that a non-heartbeat Cyphal message was successfully received.
+    pub fn on_message_received(&mut self) {
+        self.total_messages_received = self.total_messages_received.saturating_add(1);
+        self.last_message_at = Some(Instant::now());
+    }
+
+    /// Record a transport-worker error for later diagnostics.
+    pub fn record_error(&mut self, error: impl Into<String>) {
+        self.last_error = Some(error.into());
     }
 
     /// Time out the pending GetInfo if the deadline has passed.
@@ -186,6 +298,22 @@ impl WorkerState {
     /// Return a snapshot of the current node list.
     pub fn node_list(&self) -> Vec<NodeEntry> {
         self.observed_nodes.values().cloned().collect()
+    }
+
+    /// Build a diagnostics snapshot from the current worker state.
+    pub fn diagnostics(&self, local_node_id: Option<u16>) -> TransportDiagnostics {
+        TransportDiagnostics {
+            local_node_id,
+            observed_node_count: self.observed_nodes.len(),
+            total_messages_received: self.total_messages_received,
+            heartbeat_messages_received: self.heartbeat_messages_received,
+            get_info_requests_sent: self.get_info_requests_sent,
+            get_info_responses_received: self.get_info_responses_received,
+            recent_heartbeat_sources: self.recent_heartbeat_sources.iter().copied().collect(),
+            last_message_age: self.last_message_at.map(|at| at.elapsed()),
+            last_heartbeat_age: self.last_heartbeat_at.map(|at| at.elapsed()),
+            last_error: self.last_error.clone(),
+        }
     }
 }
 
@@ -282,5 +410,32 @@ pub(crate) fn make_node_info(
         name: name_bytes,
         software_image_crc: Default::default(),
         certificate_of_authenticity: Default::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkerState;
+
+    #[test]
+    fn local_node_is_listed_immediately() {
+        let mut state = WorkerState::default();
+        state.register_local_node(43);
+
+        let nodes = state.node_list();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].node_id, 43);
+        assert_eq!(nodes[0].uptime, 0);
+    }
+
+    #[test]
+    fn local_node_uptime_advances() {
+        let mut state = WorkerState::default();
+        state.register_local_node(43);
+        state.tick_local_node(43);
+        state.tick_local_node(43);
+
+        let nodes = state.node_list();
+        assert_eq!(nodes[0].uptime, 2);
     }
 }

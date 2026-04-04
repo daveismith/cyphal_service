@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+pub mod diag;
 pub mod get_info;
 pub mod hello;
 pub mod help;

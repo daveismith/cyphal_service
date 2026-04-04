@@ -28,6 +28,7 @@ pub struct CanConfig {
     /// Cyphal node ID for this transport (0–127).
     pub node_id: u8,
     /// SocketCAN interface name (e.g. "can0"). Required when `driver = "socketcan"`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub interface: Option<String>,
     /// gs_usb device index (0-based) when multiple adapters are attached.
     #[serde(default)]

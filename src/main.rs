@@ -30,7 +30,6 @@ async fn main() {
     // Initialise logging.  When running as a systemd service the output is
     // captured by journald.  The log level can be overridden via the
     // `RUST_LOG` environment variable.
-    tracing_log::LogTracer::init().ok();
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     fmt().with_env_filter(filter).init();
 

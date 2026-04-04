@@ -62,6 +62,7 @@ pub fn start(cfg: UdpConfig, shutdown: watch::Receiver<bool>) -> TransportHandle
 
     let name = cfg.name.clone();
     let name_clone = name.clone();
+    let local_node_id = cfg.node_id;
 
     tokio::task::spawn_blocking(move || {
         run_worker(cfg, cmd_rx, shutdown);
@@ -69,6 +70,7 @@ pub fn start(cfg: UdpConfig, shutdown: watch::Receiver<bool>) -> TransportHandle
 
     TransportHandle {
         name: name_clone,
+        local_node_id: Some(local_node_id),
         cmd_tx,
     }
 }
@@ -147,6 +149,7 @@ fn run_worker(
         .ok();
 
     let mut state = WorkerState::default();
+    state.register_local_node(cfg.node_id);
     let mut last_second = Instant::now();
 
     info!(transport = %name, "UDP worker started on {iface}:{port}");
@@ -157,7 +160,14 @@ fn run_worker(
         }
 
         while let Ok(cmd) = cmd_rx.try_recv() {
-            handle_command(cmd, &mut node, &get_info_token, &mut state, &name);
+            handle_command(
+                cmd,
+                &mut node,
+                &get_info_token,
+                &mut state,
+                &name,
+                cfg.node_id,
+            );
         }
 
         state.check_get_info_timeout();
@@ -165,11 +175,15 @@ fn run_worker(
         let mut handler = UdpHandler { state: &mut state };
         match node.receive(&mut handler) {
             Ok(_) => {}
-            Err(e) => debug!(transport = %name, "Receive: {e:?}"),
+            Err(e) => {
+                state.record_error(format!("Receive error: {e:?}"));
+                debug!(transport = %name, "Receive: {e:?}");
+            }
         }
 
         if last_second.elapsed() >= Duration::from_secs(1) {
             last_second = Instant::now();
+            state.tick_local_node(cfg.node_id);
             if let Err(e) = node.run_per_second_tasks() {
                 debug!(transport = %name, "Per-second task error: {e:?}");
             }
@@ -190,10 +204,14 @@ fn handle_command(
     token: &Option<ServiceToken<GetInfoRequest>>,
     state: &mut WorkerState,
     _name: &str,
+    local_node_id: u16,
 ) {
     match cmd {
         TransportCommand::ListNodes { reply } => {
             let _ = reply.send(state.node_list());
+        }
+        TransportCommand::Diagnostics { reply } => {
+            let _ = reply.send(state.diagnostics(Some(local_node_id)));
         }
         TransportCommand::GetInfo { node_id, reply } => {
             let target = match UdpNodeId::try_from(node_id) {
@@ -206,6 +224,7 @@ fn handle_command(
             if let Some(token) = token {
                 match node.send_request(token, &GetInfoRequest {}, target) {
                     Ok(_) => {
+                        state.on_get_info_request_sent();
                         state.pending_get_info = Some(PendingGetInfo {
                             node_id,
                             reply,
@@ -213,10 +232,12 @@ fn handle_command(
                         });
                     }
                     Err(e) => {
+                        state.record_error(format!("GetInfo request send failed: {e:?}"));
                         let _ = reply.send(Err(format!("Failed to send GetInfo request: {e:?}")));
                     }
                 }
             } else {
+                state.record_error("GetInfo requester not available");
                 let _ = reply.send(Err("GetInfo requester not available".into()));
             }
         }
@@ -269,6 +290,7 @@ impl<'a> TransferHandler<UdpTransport> for UdpHandler<'a> {
             }),
             Err(_) => Err("Failed to parse GetInfo response".into()),
         };
+        self.state.on_message_received();
         self.state.on_get_info_response(result);
         true
     }
