@@ -177,11 +177,7 @@ impl AllocationDb {
                 ts: row.get::<_, String>(3).unwrap_or_default(),
             })
         })
-        .unwrap_or_else(|_| {
-            // Safety: this branch is only taken when query_map returns Err,
-            // which should not happen for a valid prepared statement.
-            panic!("unexpected query_map error")
-        })
+        .unwrap_or_else(|_| unreachable!("query_map on a valid prepared statement cannot fail"))
         .filter_map(|r| r.ok())
         .collect()
     }
@@ -303,13 +299,7 @@ mod tests {
         let entries = db.list_all();
         assert_eq!(entries.len(), 1);
         // Unique ID should still be the v2 one
-        assert_eq!(
-            entries[0].unique_id_hex,
-            "abababababababababababababababababab"
-                .chars()
-                .take(32)
-                .collect::<String>()
-        );
+        assert_eq!(entries[0].unique_id_hex, "abababababababababababababababab");
         let _ = std::fs::remove_file(&path);
     }
 
