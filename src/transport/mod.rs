@@ -59,6 +59,9 @@ pub struct TransportDiagnostics {
     pub last_message_age: Option<Duration>,
     pub last_heartbeat_age: Option<Duration>,
     pub last_error: Option<String>,
+    pub pnp_enabled: bool,
+    #[allow(dead_code)]
+    pub pnp_allocations_served: u64,
 }
 
 /// Commands sent from the REPL to a transport worker thread.
@@ -75,6 +78,11 @@ pub enum TransportCommand {
     /// Request diagnostic information about the transport worker.
     Diagnostics {
         reply: mpsc::SyncSender<TransportDiagnostics>,
+    },
+    /// Request all PNP allocations for this transport.
+    #[allow(dead_code)]
+    ListAllocations {
+        reply: mpsc::SyncSender<Vec<crate::pnp::AllocationEntry>>,
     },
 }
 
@@ -147,6 +155,20 @@ impl TransportHandle {
         }
         Ok(diagnostics)
     }
+
+    /// List all PNP allocations for this transport (blocks up to `timeout`).
+    #[allow(dead_code)]
+    pub fn list_allocations(&self, timeout: Duration) -> Vec<crate::pnp::AllocationEntry> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        if self
+            .cmd_tx
+            .send(TransportCommand::ListAllocations { reply: tx })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        rx.recv_timeout(timeout).unwrap_or_default()
+    }
 }
 
 // ─── cross-platform system clock ─────────────────────────────────────────────
@@ -205,6 +227,8 @@ pub struct WorkerState {
     pub last_heartbeat_at: Option<Instant>,
     /// Most recent worker error message, if any.
     pub last_error: Option<String>,
+    /// Number of PNP node-ID allocations served by this transport.
+    pub pnp_allocations_served: u64,
 }
 
 /// An in-progress GetInfo request.
@@ -283,6 +307,11 @@ impl WorkerState {
         self.last_error = Some(error.into());
     }
 
+    /// Increment the PNP allocation counter.
+    pub fn on_pnp_allocated(&mut self) {
+        self.pnp_allocations_served = self.pnp_allocations_served.saturating_add(1);
+    }
+
     /// Time out the pending GetInfo if the deadline has passed.
     pub fn check_get_info_timeout(&mut self) {
         if self
@@ -313,6 +342,8 @@ impl WorkerState {
             last_message_age: self.last_message_at.map(|at| at.elapsed()),
             last_heartbeat_age: self.last_heartbeat_at.map(|at| at.elapsed()),
             last_error: self.last_error.clone(),
+            pnp_enabled: false, // caller sets this
+            pnp_allocations_served: self.pnp_allocations_served,
         }
     }
 }

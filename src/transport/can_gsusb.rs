@@ -45,6 +45,16 @@ use crate::transport::{
     GetInfoResult, PendingGetInfo, SystemClock, TransportCommand, TransportHandle, WorkerState,
 };
 
+use canadensis_data_types::uavcan::pnp::node_id_allocation_data_1_0::{
+    NodeIDAllocationData as AllocationDataV1, SUBJECT as PNP_V1_SUBJECT,
+};
+use canadensis_data_types::uavcan::pnp::node_id_allocation_data_2_0::{
+    NodeIDAllocationData as AllocationDataV2, SUBJECT as PNP_V2_SUBJECT,
+};
+
+use crate::config::effective_pnp_db_path;
+use crate::pnp::PnpAllocator;
+
 // ─── GS-USB protocol constants ───────────────────────────────────────────────
 
 const USB_REQ_OUT_VENDOR_DEVICE: u8 = 0x40;
@@ -709,7 +719,7 @@ fn compute_bittiming(bitrate: u32, bt: &GsDeviceBtConst) -> Option<GsDeviceBitti
 // ─── Canadensis node type aliases ─────────────────────────────────────────────
 
 const QUEUE_CAPACITY: usize = 1210;
-const NUM_PUBLISHERS: usize = 4;
+const NUM_PUBLISHERS: usize = 8;
 const NUM_REQUESTERS: usize = 4;
 const NUM_TRANSFER_IDS: usize = 4;
 
@@ -817,6 +827,39 @@ fn run_worker(
     state.register_local_node(u16::from(cfg.node_id));
     let mut last_second = Instant::now();
 
+    // ─── PNP allocator ────────────────────────────────────────────────────────
+    let mut pnp_allocator: Option<PnpAllocator> = if cfg.pnp_enabled {
+        let db_path = effective_pnp_db_path(&name, cfg.pnp_db_path.as_deref());
+        match crate::pnp::AllocationDb::open(&db_path) {
+            Ok(db) => {
+                if let Err(e) = node.subscribe_message(PNP_V2_SUBJECT, 18, milliseconds(5000)) {
+                    warn!(transport = %name, "Failed to subscribe to PNP v2: {e:?}");
+                }
+                if let Err(e) = node.subscribe_message(PNP_V1_SUBJECT, 9, milliseconds(5000)) {
+                    warn!(transport = %name, "Failed to subscribe to PNP v1: {e:?}");
+                }
+                if let Err(e) =
+                    node.start_publishing(PNP_V2_SUBJECT, milliseconds(500), Priority::Nominal)
+                {
+                    warn!(transport = %name, "Failed to start PNP v2 publisher: {e:?}");
+                }
+                if let Err(e) =
+                    node.start_publishing(PNP_V1_SUBJECT, milliseconds(500), Priority::Nominal)
+                {
+                    warn!(transport = %name, "Failed to start PNP v1 publisher: {e:?}");
+                }
+                info!(transport = %name, db = %db_path.display(), "PNP allocator started");
+                Some(PnpAllocator::new(db, u16::from(cfg.node_id), 127))
+            }
+            Err(e) => {
+                warn!(transport = %name, "Failed to open PNP DB {}: {e}", db_path.display());
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     info!(transport = %name, "gs_usb CAN worker started");
 
     loop {
@@ -834,6 +877,7 @@ fn run_worker(
                 &mut state,
                 &name,
                 cfg.node_id,
+                pnp_allocator.as_ref(),
             );
         }
 
@@ -841,7 +885,10 @@ fn run_worker(
         state.check_get_info_timeout();
 
         // Poll for incoming CAN frames.
-        let mut handler = GsUsbHandler { state: &mut state };
+        let mut handler = GsUsbHandler {
+            state: &mut state,
+            pnp: pnp_allocator.as_mut(),
+        };
         match node.receive(&mut handler) {
             Ok(_) => {}
             Err(CanError::Driver(GsUsbError::Usb(rusb::Error::Timeout)))
@@ -875,13 +922,16 @@ fn handle_command(
     state: &mut WorkerState,
     _name: &str,
     local_node_id: u8,
+    pnp: Option<&PnpAllocator>,
 ) {
     match cmd {
         TransportCommand::ListNodes { reply } => {
             let _ = reply.send(state.node_list());
         }
         TransportCommand::Diagnostics { reply } => {
-            let _ = reply.send(state.diagnostics(Some(u16::from(local_node_id))));
+            let mut diag = state.diagnostics(Some(u16::from(local_node_id)));
+            diag.pnp_enabled = pnp.is_some();
+            let _ = reply.send(diag);
         }
         TransportCommand::GetInfo { node_id, reply } => {
             if node_id > 127 {
@@ -917,6 +967,10 @@ fn handle_command(
                 let _ = reply.send(Err("GetInfo requester not available".into()));
             }
         }
+        TransportCommand::ListAllocations { reply } => {
+            let entries = pnp.map(|a| a.list_allocations()).unwrap_or_default();
+            let _ = reply.send(entries);
+        }
     }
 }
 
@@ -924,24 +978,53 @@ fn handle_command(
 
 struct GsUsbHandler<'a> {
     state: &'a mut WorkerState,
+    pnp: Option<&'a mut PnpAllocator>,
 }
 
 impl<'a> TransferHandler<CanTransport> for GsUsbHandler<'a> {
     fn handle_message<N: Node<Transport = CanTransport>>(
         &mut self,
-        _node: &mut N,
+        node: &mut N,
         transfer: &MessageTransfer<Vec<u8>, CanTransport>,
     ) -> bool {
-        if transfer.header.subject != HEARTBEAT_SUBJECT {
-            return false;
+        let source = transfer.header.source.map(u16::from);
+
+        if transfer.header.subject == HEARTBEAT_SUBJECT {
+            let Ok(hb) = Heartbeat::deserialize_from_bytes(&transfer.payload) else {
+                return false;
+            };
+            let node_id: u16 = source.unwrap_or(0xFFFF);
+            if let Some(pnp) = &mut self.pnp {
+                pnp.on_heartbeat(node_id);
+            }
+            self.state
+                .on_heartbeat(node_id, hb.uptime, hb.health.value, hb.mode.value);
+            return true;
         }
-        let Ok(hb) = Heartbeat::deserialize_from_bytes(&transfer.payload) else {
-            return false;
-        };
-        let node_id: u16 = transfer.header.source.map(u16::from).unwrap_or(0xFFFF);
-        self.state
-            .on_heartbeat(node_id, hb.uptime, hb.health.value, hb.mode.value);
-        true
+
+        if let Some(pnp) = &mut self.pnp {
+            if transfer.header.subject == PNP_V2_SUBJECT {
+                if let Ok(msg) = AllocationDataV2::deserialize_from_bytes(&transfer.payload)
+                    && let Some(response) = pnp.on_allocation_v2(&msg, source)
+                {
+                    let _ = node.publish(PNP_V2_SUBJECT, &response);
+                    self.state.on_pnp_allocated();
+                }
+                return true;
+            }
+
+            if transfer.header.subject == PNP_V1_SUBJECT {
+                if let Ok(msg) = AllocationDataV1::deserialize_from_bytes(&transfer.payload)
+                    && let Some(response) = pnp.on_allocation_v1(&msg, source)
+                {
+                    let _ = node.publish(PNP_V1_SUBJECT, &response);
+                    self.state.on_pnp_allocated();
+                }
+                return true;
+            }
+        }
+
+        false
     }
 
     fn handle_response<N: Node<Transport = CanTransport>>(
