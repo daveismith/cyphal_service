@@ -32,6 +32,7 @@ log = "0.4"
 tracing-log = "0.2"
 rand = "0.8"
 heapless = "0.9"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 canadensis_linux = "0.6.0"
