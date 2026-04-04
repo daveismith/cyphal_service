@@ -14,6 +14,9 @@
 
 #![allow(dead_code)]
 
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
 use canadensis_data_types::uavcan::node::id_1_0::ID as NodeId;
 use canadensis_data_types::uavcan::pnp::node_id_allocation_data_1_0::NodeIDAllocationData as AllocationDataV1;
 use canadensis_data_types::uavcan::pnp::node_id_allocation_data_2_0::NodeIDAllocationData as AllocationDataV2;
@@ -21,11 +24,21 @@ use tracing::{debug, info, warn};
 
 use crate::pnp::db::{AllocationDb, AllocationEntry};
 
+/// Minimum time that must elapse between successive GetInfo enqueues for the
+/// same node. Prevents re-queuing a node that simply does not implement GetInfo.
+const GET_INFO_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
+
 /// Single-allocator PNP node-ID assignment service.
 pub struct PnpAllocator {
     db: AllocationDb,
     local_node_id: u16,
     max_node_id: u16,
+    /// Queue of node IDs that need a GetInfo service request to retrieve their
+    /// full 128-bit unique ID.  Drained by the transport worker.
+    get_info_queue: VecDeque<u16>,
+    /// Tracks when a GetInfo was last enqueued for a given node ID, to prevent
+    /// retrying too frequently for nodes that do not implement GetInfo.
+    recently_queried: HashMap<u16, Instant>,
 }
 
 impl PnpAllocator {
@@ -45,6 +58,8 @@ impl PnpAllocator {
             db,
             local_node_id,
             max_node_id,
+            get_info_queue: VecDeque::new(),
+            recently_queried: HashMap::new(),
         }
     }
 
@@ -130,9 +145,68 @@ impl PnpAllocator {
     ///
     /// Records the node as a static node if not already in the allocation table,
     /// preventing its ID from being assigned to a PNP node.
+    ///
+    /// If the stored unique ID is still a placeholder (all-zeros for a static
+    /// node, or a 48-bit hash for a v1 PNP node), this method enqueues a
+    /// GetInfo request so the transport worker can retrieve the real 128-bit
+    /// unique ID.  Re-enqueueing is rate-limited by `GET_INFO_RETRY_COOLDOWN`.
     pub fn on_heartbeat(&mut self, node_id: u16) {
         if let Err(e) = self.db.record_static_node(node_id) {
             warn!(node_id, "PNP: failed to record static node: {e}");
+        }
+
+        // Enqueue a GetInfo for static and v1 nodes whose unique ID is still a
+        // placeholder, unless we queried this node recently.
+        let needs_query = self
+            .db
+            .find_by_node_id(node_id)
+            .is_some_and(|e| e.needs_get_info());
+
+        if needs_query {
+            let cooldown_elapsed = self
+                .recently_queried
+                .get(&node_id)
+                .is_none_or(|t| t.elapsed() >= GET_INFO_RETRY_COOLDOWN);
+
+            if cooldown_elapsed {
+                debug!(node_id, "PNP: queuing GetInfo for node");
+                self.get_info_queue.push_back(node_id);
+                self.recently_queried.insert(node_id, Instant::now());
+            }
+        }
+    }
+
+    /// Pop the next node ID that needs a GetInfo service request, if any.
+    ///
+    /// The transport worker calls this once per loop iteration when no
+    /// PNP-triggered GetInfo is already in flight.
+    pub fn pop_get_info_request(&mut self) -> Option<u16> {
+        self.get_info_queue.pop_front()
+    }
+
+    /// Report the result of a PNP-triggered GetInfo request.
+    ///
+    /// On success (`uid = Some(…)`) the full unique ID is persisted in the
+    /// allocation database. On failure / timeout (`uid = None`) the
+    /// `recently_queried` entry is cleared immediately so the node can be
+    /// retried on its next heartbeat rather than waiting the full cooldown.
+    pub fn on_get_info_result(&mut self, node_id: u16, uid: Option<[u8; 16]>) {
+        match uid {
+            Some(uid) => {
+                if let Err(e) = self.db.update_unique_id(node_id, &uid) {
+                    warn!(node_id, "PNP: failed to update unique ID: {e}");
+                } else {
+                    info!(node_id, "PNP: unique ID updated from GetInfo response");
+                }
+            }
+            None => {
+                // Remove the cooldown so the next heartbeat can retry.
+                self.recently_queried.remove(&node_id);
+                debug!(
+                    node_id,
+                    "PNP: GetInfo timed out, will retry on next heartbeat"
+                );
+            }
         }
     }
 
@@ -315,6 +389,117 @@ mod tests {
         alloc.on_allocation_v2(&make_v2_request(uid), None);
         let entries = alloc.list_allocations();
         assert!(entries.len() >= 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_heartbeat_enqueues_get_info_for_static_node() {
+        let (mut alloc, path) = temp_allocator(100, 127);
+        alloc.on_heartbeat(5);
+        assert_eq!(
+            alloc.pop_get_info_request(),
+            Some(5),
+            "static node should be enqueued for GetInfo"
+        );
+        assert!(
+            alloc.pop_get_info_request().is_none(),
+            "queue should be empty after pop"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_heartbeat_enqueues_get_info_for_v1_node() {
+        let (mut alloc, path) = temp_allocator(100, 127);
+        alloc
+            .on_allocation_v1(&make_v1_request(0xDEAD_BEEF_CAFE), None)
+            .unwrap();
+        let entries = alloc.list_allocations();
+        let v1_entry = entries
+            .iter()
+            .find(|e| e.pseudo_unique_id.is_some())
+            .unwrap();
+        let v1_node_id = v1_entry.node_id;
+
+        alloc.on_heartbeat(v1_node_id);
+        assert_eq!(
+            alloc.pop_get_info_request(),
+            Some(v1_node_id),
+            "v1 node should be enqueued for GetInfo after heartbeat"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_heartbeat_cooldown_prevents_duplicate_enqueue() {
+        let (mut alloc, path) = temp_allocator(100, 127);
+        alloc.on_heartbeat(5);
+        alloc.pop_get_info_request();
+
+        alloc.on_heartbeat(5);
+        assert!(
+            alloc.pop_get_info_request().is_none(),
+            "within cooldown, node must not be re-enqueued"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_on_get_info_result_success_stops_reenqueue() {
+        let (mut alloc, path) = temp_allocator(100, 127);
+        alloc.on_heartbeat(5);
+        alloc.pop_get_info_request();
+
+        let uid: [u8; 16] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ];
+        alloc.on_get_info_result(5, Some(uid));
+
+        let entries = alloc.list_allocations();
+        let entry = entries.iter().find(|e| e.node_id == 5).unwrap();
+        assert!(
+            !entry.needs_get_info(),
+            "node should no longer need GetInfo"
+        );
+
+        alloc.on_heartbeat(5);
+        assert!(
+            alloc.pop_get_info_request().is_none(),
+            "node with real unique ID must not be re-enqueued"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_on_get_info_result_timeout_allows_retry() {
+        let (mut alloc, path) = temp_allocator(100, 127);
+        alloc.on_heartbeat(5);
+        alloc.pop_get_info_request();
+
+        alloc.on_get_info_result(5, None);
+
+        alloc.on_heartbeat(5);
+        assert_eq!(
+            alloc.pop_get_info_request(),
+            Some(5),
+            "after timeout, next heartbeat must re-enqueue"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_v2_node_not_enqueued_for_get_info() {
+        let (mut alloc, path) = temp_allocator(100, 127);
+        let uid: [u8; 16] = [0xAA; 16];
+        let resp = alloc.on_allocation_v2(&make_v2_request(uid), None).unwrap();
+        let assigned_id = resp.node_id.value;
+
+        alloc.on_heartbeat(assigned_id);
+        assert!(
+            alloc.pop_get_info_request().is_none(),
+            "v2 node already has a real unique ID and must not be enqueued"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

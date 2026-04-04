@@ -209,8 +209,10 @@ impl Clock for SystemClock {
 pub struct WorkerState {
     /// Nodes observed via heartbeat messages, keyed by node ID.
     pub observed_nodes: HashMap<u16, NodeEntry>,
-    /// Pending GetInfo request, if any.
+    /// Pending GetInfo request triggered by the REPL / CLI, if any.
     pub pending_get_info: Option<PendingGetInfo>,
+    /// Pending GetInfo request triggered automatically by the PNP allocator, if any.
+    pub pnp_pending_get_info: Option<PnpGetInfoPending>,
     /// Total successfully decoded Cyphal messages seen on the transport.
     pub total_messages_received: u64,
     /// Number of successfully decoded Heartbeat messages seen on the transport.
@@ -229,6 +231,14 @@ pub struct WorkerState {
     pub last_error: Option<String>,
     /// Number of PNP node-ID allocations served by this transport.
     pub pnp_allocations_served: u64,
+}
+
+/// An in-progress GetInfo request triggered by the PNP allocator.
+pub struct PnpGetInfoPending {
+    /// Target node ID.
+    pub node_id: u16,
+    /// Request deadline.
+    pub deadline: Instant,
 }
 
 /// An in-progress GetInfo request.
@@ -322,6 +332,22 @@ impl WorkerState {
             let reply = self.pending_get_info.take().unwrap().reply;
             let _ = reply.send(Err("GetInfo request timed out".into()));
         }
+    }
+
+    /// Time out the PNP-triggered pending GetInfo if the deadline has passed.
+    ///
+    /// Returns `Some(node_id)` when the pending request has expired so the
+    /// caller can report the timeout to `PnpAllocator::on_get_info_result`.
+    pub fn check_pnp_get_info_timeout(&mut self) -> Option<u16> {
+        if self
+            .pnp_pending_get_info
+            .as_ref()
+            .is_some_and(|p| Instant::now() > p.deadline)
+        {
+            let node_id = self.pnp_pending_get_info.take().unwrap().node_id;
+            return Some(node_id);
+        }
+        None
     }
 
     /// Return a snapshot of the current node list.
