@@ -9,11 +9,19 @@ env:
   BINARY_NAME: cyphal_service
 
 jobs:
-  build-ubuntu:
-    name: Build release artifacts (Ubuntu 24.04 x86_64)
-    runs-on: ubuntu-24.04
+  build:
+    name: Build release artifacts (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
+
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
 
     steps:
       - name: Checkout repository
@@ -32,9 +40,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-release-
+            ${{ runner.os }}-${{ matrix.arch }}-cargo-release-
 
       - name: Build release binary
         run: cargo build --release
@@ -82,7 +90,7 @@ jobs:
       - name: Create tarball
         run: |
           VERSION="${GITHUB_REF_NAME}"
-          TARBALL="${BINARY_NAME}-${VERSION}-x86_64-linux.tar.gz"
+          TARBALL="${BINARY_NAME}-${VERSION}-${{ matrix.arch }}-linux.tar.gz"
           tar -czf "${TARBALL}" -C staging "${BINARY_NAME}"
           echo "TARBALL=${TARBALL}" >> "${GITHUB_ENV}"
 
