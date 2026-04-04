@@ -15,20 +15,64 @@ the `--foreground` flag, making it portable to any host.
 
 ---
 
+## Platform support
+
+| Mode | Linux | macOS |
+|------|-------|-------|
+| Daemon (systemd) | ✅ primary target | ❌ not supported |
+| Foreground / REPL | ✅ | ✅ must be kept working |
+| Cyphal/CAN – SocketCAN | ✅ (native + gs_usb via kernel driver) | ❌ no SocketCAN kernel subsystem |
+| Cyphal/CAN – gs_usb direct USB | ✅ (also works, no kernel driver needed) | ✅ only CAN option |
+| Cyphal/UDP | ✅ | ✅ |
+| Cyphal/Serial | ✅ | ✅ |
+
+**The foreground / REPL mode must remain functional on macOS.**  Any code that
+is Linux-specific (SocketCAN, systemd, epoll-based CAN I/O) **must** be gated
+behind `#[cfg(target_os = "linux")]` and must not be compiled or linked on
+macOS.
+
+For CAN on macOS the only viable approach is a userspace USB driver that speaks
+the **gs_usb / candleLight protocol** directly over libusb (`rusb` crate).
+This means candlelight-compatible USB CAN adapters (CANable, Canable-M, etc.)
+work identically on Linux and macOS through the same gs_usb code path (on
+Linux the SocketCAN path is preferred for performance, but the gs_usb path is
+also available as a fallback and for macOS).
+
+Platform-specific transport selection in code:
+
+```rust
+#[cfg(target_os = "linux")]
+use crate::transport::can_socketcan::SocketCanDriver;
+
+use crate::transport::can_gsusb::GsUsbDriver;   // available on all platforms
+```
+
+---
+
 ## Project structure
 
 ```
 cyphal_service/
 ├── src/
-│   ├── main.rs           – Entry point, CLI argument parsing (clap)
-│   ├── daemon.rs         – Async daemon loop (tokio) + systemd sd_notify
-│   ├── cli.rs            – Foreground REPL (rustyline) + background tick thread
+│   ├── main.rs              – Entry point, CLI argument parsing (clap)
+│   ├── daemon.rs            – Async daemon loop (tokio) + systemd sd_notify
+│   ├── cli.rs               – Foreground REPL (rustyline) + background tick thread
+│   ├── config.rs            – TOML configuration types + load_config()
+│   ├── transport/
+│   │   ├── mod.rs           – TransportManager, TransportHandle, NodeEntry
+│   │   ├── can_socketcan.rs – Cyphal/CAN via SocketCAN (#[cfg(target_os = "linux")])
+│   │   ├── can_gsusb.rs     – Cyphal/CAN via gs_usb/candleLight (all platforms)
+│   │   ├── udp.rs           – Cyphal/UDP
+│   │   └── serial.rs        – Cyphal/Serial
 │   └── commands/
-│       ├── mod.rs        – Command trait & CommandRegistry
-│       ├── hello.rs      – HelloCommand ("hello" REPL command)
-│       └── help.rs       – HelpCommand + format_help() utility
+│       ├── mod.rs           – Command trait & CommandRegistry
+│       ├── hello.rs         – HelloCommand ("hello" REPL command)
+│       ├── help.rs          – HelpCommand + format_help() utility
+│       ├── nodes.rs         – NodesCommand ("nodes [<transport>]")
+│       └── get_info.rs      – GetInfoCommand ("get-info <transport> <node-id>")
 ├── config/
-│   └── cyphal_service.service  – systemd unit file
+│   ├── cyphal_service.service  – systemd unit file
+│   └── cyphal.toml.example     – annotated example Cyphal transport config
 ├── .github/
 │   ├── copilot-instructions.md  – this file
 │   └── workflows/
@@ -36,8 +80,6 @@ cyphal_service/
 │       └── release.yml   – Build release artefact and attach to GitHub Release
 └── README.md
 ```
-
----
 
 ## Adding a new command
 
@@ -110,6 +152,8 @@ cargo run
 - Logging: **tracing** + **tracing-subscriber** (env-filter).
 - REPL line editing: **rustyline**.
 - systemd notify: **sd-notify** (degrades gracefully when not under systemd).
+- CAN on Linux: use `canadensis_linux::LinuxCan` wrapping a `socketcan` socket, gated with `#[cfg(target_os = "linux")]`.
+- CAN on macOS / cross-platform: use the gs_usb userspace driver (`rusb` / libusb), available on all platforms. The gs_usb path works on Linux too and does not require the `gs_usb` kernel module.
 - Use `tracing::{info, warn, error}` macros instead of `println!` in
   production paths (except the deliberate `hello` output).
 - Follow standard Rust naming conventions (snake_case for functions and

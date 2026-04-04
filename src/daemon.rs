@@ -3,6 +3,9 @@ use tokio::sync::watch;
 use tokio::time;
 use tracing::{info, warn};
 
+use crate::config::AppConfig;
+use crate::transport;
+
 /// Interval between "hello" ticks.
 const TICK_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -42,13 +45,16 @@ pub async fn run_tasks(mut shutdown: watch::Receiver<bool>) {
 ///
 /// Starts [`run_tasks`] and exits cleanly on SIGTERM or SIGINT.  When running
 /// under systemd the process notifies readiness via `sd_notify`.
-pub async fn run() {
+pub async fn run(config: AppConfig) {
     // Notify systemd that we are ready (no-op when not running under systemd).
     if let Err(e) = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]) {
         warn!("sd_notify ready failed (not running under systemd?): {e}");
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // Start transport workers.
+    let _handles = transport::start_all(&config, shutdown_rx.clone()).await;
 
     let tasks = tokio::spawn(run_tasks(shutdown_rx));
 
