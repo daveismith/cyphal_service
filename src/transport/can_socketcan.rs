@@ -28,7 +28,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::CanConfig;
 use crate::transport::{
-    GetInfoResult, PendingGetInfo, TransportCommand, TransportHandle, WorkerState,
+    GetInfoResult, PendingGetInfo, PnpGetInfoPending, TransportCommand, TransportHandle,
+    WorkerState,
 };
 
 use canadensis_data_types::uavcan::pnp::node_id_allocation_data_1_0::{
@@ -214,6 +215,44 @@ fn run_worker(
 
         state.check_get_info_timeout();
 
+        // Dispatch next PNP-triggered GetInfo if none is in flight.
+        if state.pnp_pending_get_info.is_none()
+            && let Some(pnp) = pnp_allocator.as_mut()
+            && let Some(node_id) = pnp.pop_get_info_request()
+        {
+            if node_id <= 127 {
+                if let (Some(token), Ok(target)) =
+                    (&get_info_token, CanNodeId::try_from(node_id as u8))
+                {
+                    match node.send_request(token, &GetInfoRequest {}, target) {
+                        Ok(_) => {
+                            state.on_get_info_request_sent();
+                            state.pnp_pending_get_info = Some(PnpGetInfoPending {
+                                node_id,
+                                deadline: Instant::now() + Duration::from_secs(5),
+                            });
+                            debug!(transport = %name, node_id, "PNP GetInfo request sent");
+                        }
+                        Err(e) => {
+                            debug!(transport = %name, node_id, "PNP GetInfo send failed: {e:?}");
+                            pnp.on_get_info_result(node_id, None);
+                        }
+                    }
+                } else {
+                    pnp.on_get_info_result(node_id, None);
+                }
+            } else {
+                pnp.on_get_info_result(node_id, None);
+            }
+        }
+
+        // Report PNP GetInfo timeouts back to the allocator.
+        if let Some(timed_out) = state.check_pnp_get_info_timeout()
+            && let Some(pnp) = pnp_allocator.as_mut()
+        {
+            pnp.on_get_info_result(timed_out, None);
+        }
+
         let mut handler = SocketCanHandler {
             state: &mut state,
             pnp: pnp_allocator.as_mut(),
@@ -363,22 +402,51 @@ impl<'a> TransferHandler<CanTransport> for SocketCanHandler<'a> {
         if transfer.header.service != GET_INFO_SERVICE {
             return false;
         }
-        let Some(ref pending) = self.state.pending_get_info else {
+
+        let source_node_id = u16::from(transfer.header.source);
+
+        let matches_cli = self
+            .state
+            .pending_get_info
+            .as_ref()
+            .is_some_and(|p| p.node_id == source_node_id);
+        let matches_pnp = self
+            .state
+            .pnp_pending_get_info
+            .as_ref()
+            .is_some_and(|p| p.node_id == source_node_id);
+
+        if !matches_cli && !matches_pnp {
             return false;
-        };
-        let expected_node_id = pending.node_id;
-        let result = match GetInfoResponse::deserialize_from_bytes(&transfer.payload) {
-            Ok(resp) => Ok(GetInfoResult {
-                node_id: expected_node_id,
-                name: String::from_utf8_lossy(&resp.name).into_owned(),
-                hardware_version: (resp.hardware_version.major, resp.hardware_version.minor),
-                software_version: (resp.software_version.major, resp.software_version.minor),
-                unique_id: resp.unique_id,
-            }),
-            Err(_) => Err("Failed to parse GetInfo response".into()),
-        };
+        }
+
+        let parsed = GetInfoResponse::deserialize_from_bytes(&transfer.payload);
+
+        if matches_cli {
+            let result = match &parsed {
+                Ok(resp) => Ok(GetInfoResult {
+                    node_id: source_node_id,
+                    name: String::from_utf8_lossy(&resp.name).into_owned(),
+                    hardware_version: (resp.hardware_version.major, resp.hardware_version.minor),
+                    software_version: (resp.software_version.major, resp.software_version.minor),
+                    unique_id: resp.unique_id,
+                }),
+                Err(_) => Err("Failed to parse GetInfo response".into()),
+            };
+            self.state.on_get_info_response(result);
+        }
+
+        if matches_pnp {
+            self.state.pnp_pending_get_info = None;
+            self.state.get_info_responses_received =
+                self.state.get_info_responses_received.saturating_add(1);
+            let uid = parsed.as_ref().map(|r| r.unique_id).ok();
+            if let Some(pnp) = &mut self.pnp {
+                pnp.on_get_info_result(source_node_id, uid);
+            }
+        }
+
         self.state.on_message_received();
-        self.state.on_get_info_response(result);
         true
     }
 

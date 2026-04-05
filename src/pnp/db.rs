@@ -25,6 +25,38 @@ pub struct AllocationEntry {
     pub ts: String,
 }
 
+impl AllocationEntry {
+    /// Return `true` if this entry's unique ID is still a placeholder and a
+    /// `GetInfo` request should be issued to obtain the real 128-bit unique ID.
+    ///
+    /// Two cases require a GetInfo:
+    /// - Static nodes recorded via heartbeat: `unique_id_hex` is all zeros and
+    ///   `pseudo_unique_id` is `None`.
+    /// - v1 PNP allocations where the real 128-bit unique ID has not yet been
+    ///   obtained: `pseudo_unique_id` is `Some(_)` **and** `unique_id_hex` is
+    ///   still the padded placeholder derived from the 48-bit hash (20 zero hex
+    ///   characters followed by 12 hex characters of the hash bytes).
+    ///
+    /// Once a successful GetInfo updates `unique_id_hex` to the real 128-bit
+    /// value, `pseudo_unique_id` is intentionally preserved so that
+    /// `find_by_hash` can still re-identify the node on the next reboot.
+    pub fn needs_get_info(&self) -> bool {
+        match self.pseudo_unique_id {
+            None => self.unique_id_hex == "0".repeat(32),
+            Some(hash) => {
+                // v1 node: needs GetInfo while unique_id_hex is still the
+                // padded placeholder derived from the hash.  The placeholder is
+                // constructed as 10 zero bytes followed by the lower 6 bytes of
+                // the hash (matching the format written by insert_v1).
+                let hash_bytes = (hash as u64).to_be_bytes();
+                let mut padded = [0u8; 16];
+                padded[10..16].copy_from_slice(&hash_bytes[2..8]);
+                self.unique_id_hex == bytes_to_hex(&padded)
+            }
+        }
+    }
+}
+
 /// Thin wrapper around a SQLite connection providing the allocation table operations.
 pub struct AllocationDb {
     conn: Connection,
@@ -158,6 +190,45 @@ impl AllocationDb {
             )
             .map(|_| ())
             .map_err(|e| format!("DB record_static_node failed: {e}"))
+    }
+
+    /// Look up an allocation entry by node ID.
+    ///
+    /// Returns `Some(entry)` if a row with `node_id` exists, `None` otherwise.
+    pub fn find_by_node_id(&self, node_id: u16) -> Option<AllocationEntry> {
+        self.conn
+            .query_row(
+                "SELECT node_id, unique_id_hex, pseudo_unique_id, ts \
+                 FROM allocation WHERE node_id = ?1 LIMIT 1",
+                params![node_id as i64],
+                |row| {
+                    Ok(AllocationEntry {
+                        node_id: row.get::<_, i64>(0)? as u16,
+                        unique_id_hex: row.get::<_, String>(1).unwrap_or_default(),
+                        pseudo_unique_id: row.get::<_, Option<i64>>(2)?,
+                        ts: row.get::<_, String>(3).unwrap_or_default(),
+                    })
+                },
+            )
+            .ok()
+    }
+
+    /// Update the 128-bit unique ID for an existing allocation entry.
+    ///
+    /// Sets `unique_id_hex` to the full 32-character hex encoding of `uid`.
+    /// `pseudo_unique_id` is intentionally left unchanged: for v1 allocations
+    /// the hash must be preserved so that `find_by_hash` can re-identify the
+    /// node across reboots when it sends a new PNP allocation request.
+    /// Does nothing if `node_id` is not present in the table.
+    pub fn update_unique_id(&self, node_id: u16, uid: &[u8; 16]) -> Result<(), String> {
+        let hex = bytes_to_hex(uid);
+        self.conn
+            .execute(
+                "UPDATE allocation SET unique_id_hex = ?1 WHERE node_id = ?2",
+                params![hex, node_id as i64],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("DB update_unique_id failed: {e}"))
     }
 
     /// Return all rows in the allocation table, ordered by node_id.
@@ -331,5 +402,157 @@ mod tests {
     fn test_bytes_to_hex() {
         assert_eq!(bytes_to_hex(&[0x00, 0xAB, 0xCD]), "00abcd");
         assert_eq!(bytes_to_hex(&[0; 16]), "0".repeat(32));
+    }
+
+    #[test]
+    fn test_needs_get_info_static_node() {
+        let entry = AllocationEntry {
+            node_id: 5,
+            unique_id_hex: "0".repeat(32),
+            pseudo_unique_id: None,
+            ts: String::new(),
+        };
+        assert!(
+            entry.needs_get_info(),
+            "all-zero unique_id means get_info is needed"
+        );
+    }
+
+    #[test]
+    fn test_needs_get_info_v1_node() {
+        let entry = AllocationEntry {
+            node_id: 5,
+            unique_id_hex: "00000000000000000000aabbccddeeff".into(),
+            pseudo_unique_id: Some(0xAABBCCDDEEFF_i64),
+            ts: String::new(),
+        };
+        assert!(entry.needs_get_info(), "v1 hash means get_info is needed");
+    }
+
+    #[test]
+    fn test_needs_get_info_v2_node() {
+        let entry = AllocationEntry {
+            node_id: 5,
+            unique_id_hex: "0102030405060708090a0b0c0d0e0f10".into(),
+            pseudo_unique_id: None,
+            ts: String::new(),
+        };
+        assert!(
+            !entry.needs_get_info(),
+            "v2 node has real unique_id, no get_info needed"
+        );
+    }
+
+    #[test]
+    fn test_find_by_node_id_present() {
+        let (db, path) = temp_db();
+        let uid: [u8; 16] = [0xDE; 16];
+        db.insert_v2(42, &uid).unwrap();
+        let entry = db.find_by_node_id(42).expect("node 42 should be found");
+        assert_eq!(entry.node_id, 42);
+        assert_eq!(entry.unique_id_hex, bytes_to_hex(&uid));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_find_by_node_id_absent() {
+        let (db, path) = temp_db();
+        assert!(db.find_by_node_id(99).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_update_unique_id_preserves_hash_for_v1_reallocation() {
+        // The v1 hash (pseudo_unique_id) must survive an update_unique_id call so
+        // that find_by_hash can still re-identify the node when it reboots and
+        // sends a new PNP allocation request.
+        let (db, path) = temp_db();
+        let hash: u64 = 0xAABBCC_DDEEFF;
+        db.insert_v1(10, hash).unwrap();
+
+        let uid: [u8; 16] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ];
+        db.update_unique_id(10, &uid).unwrap();
+
+        let entry = db.find_by_node_id(10).unwrap();
+        assert_eq!(entry.unique_id_hex, bytes_to_hex(&uid));
+        assert_eq!(
+            entry.pseudo_unique_id,
+            Some(hash as i64),
+            "pseudo_unique_id must be preserved so find_by_hash works after reboot"
+        );
+        // find_by_hash must still return the correct node ID.
+        assert_eq!(
+            db.find_by_hash(hash),
+            Some(10),
+            "find_by_hash must still resolve the node ID after update_unique_id"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_update_unique_id_on_static_node() {
+        let (db, path) = temp_db();
+        db.record_static_node(7).unwrap();
+
+        let uid: [u8; 16] = [0xAB; 16];
+        db.update_unique_id(7, &uid).unwrap();
+
+        let entry = db.find_by_node_id(7).unwrap();
+        assert_eq!(entry.unique_id_hex, bytes_to_hex(&uid));
+        assert!(entry.pseudo_unique_id.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_update_unique_id_no_longer_needs_get_info() {
+        let (db, path) = temp_db();
+        db.record_static_node(3).unwrap();
+        assert!(db.find_by_node_id(3).unwrap().needs_get_info());
+
+        let uid: [u8; 16] = [0xCC; 16];
+        db.update_unique_id(3, &uid).unwrap();
+        assert!(!db.find_by_node_id(3).unwrap().needs_get_info());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_update_unique_id_v1_no_longer_needs_get_info() {
+        // After GetInfo resolves the real UID for a v1 node, needs_get_info()
+        // must return false even though pseudo_unique_id is still set.
+        let (db, path) = temp_db();
+        let hash: u64 = 0xCAFE_BABE_1234;
+        db.insert_v1(20, hash).unwrap();
+        assert!(
+            db.find_by_node_id(20).unwrap().needs_get_info(),
+            "unresolved v1 node must need GetInfo"
+        );
+
+        let uid: [u8; 16] = [0xAA; 16];
+        db.update_unique_id(20, &uid).unwrap();
+        assert!(
+            !db.find_by_node_id(20).unwrap().needs_get_info(),
+            "resolved v1 node must not need GetInfo"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_needs_get_info_v1_node_resolved() {
+        // A v1 entry whose unique_id_hex has been updated to a real value
+        // (not the padded-hash placeholder) must not require GetInfo even
+        // though pseudo_unique_id is still present.
+        let entry = AllocationEntry {
+            node_id: 5,
+            unique_id_hex: "0102030405060708090a0b0c0d0e0f10".into(),
+            pseudo_unique_id: Some(0xAABBCCDDEEFF_i64),
+            ts: String::new(),
+        };
+        assert!(
+            !entry.needs_get_info(),
+            "v1 node with real unique_id must not need GetInfo"
+        );
     }
 }
